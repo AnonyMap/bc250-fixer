@@ -38,7 +38,7 @@ The write changes only the GPU reservation. It refuses if any memory timing in t
 | `gov status` | Whether it's running, the voltage curve, the clock limit, the current clock and tuning results. |
 | `gov safe` / `gov limit MHZ` | Caps the clock at the 1500 MHz baseline, or at `MHZ`. |
 | `gov tune` | Steps the clock up 50 MHz at a time, testing each step, and recommends a limit one step below the highest that held. |
-| `gov undervolt [MHZ]` | Steps the voltage down at one clock (default 1500 MHz) to cut heat, and offers to save the lowest stable voltage plus 20 mV. |
+| `gov undervolt [MHZ]` | Steps the voltage down at one point on the curve (default 1500 MHz) to cut heat. Checks the clocks on either side at their new voltages, then offers to save the lowest stable voltage plus 20 mV. |
 | `gov restore` | Puts back the governor config from before this tool's first change. |
 | `soak [MINUTES]` | Stability soak at the current settings. |
 | `monitor` | Live GPU clock, temperatures, power, GPU memory, RAM, swap. `--log file.csv` saves samples. |
@@ -65,6 +65,7 @@ The write changes only the GPU reservation. It refuses if any memory timing in t
   - `--step-seconds S` sets how long each step runs (default 120).
   - `--min-mv MV` is the undervolt floor (default 100 mV below your curve, never under 700).
   - `--ollama-load` keeps Ollama running as heat load.
+  - `--retest-frozen` tests clocks at or above one that froze the board before (normally skipped).
   - `--temp-limit C` works as in `cu test`.
 
 ## Unlocking compute units
@@ -98,14 +99,19 @@ sudo bc250-fixer soak           # a longer check at the new limit
 sudo bc250-fixer gov undervolt  # optional: less voltage at 1500 MHz = less heat
 ```
 
-- **Installing:** Fedora gets the [COPR package](https://copr.fedorainfracloud.org/coprs/filippor/bazzite/), Bazzite and other rpm-ostree systems get it layered (then reboot and run `gov install` again), Arch gets the AUR package through `paru` or `yay`, and Debian/Ubuntu get the release `.deb`. Anything else gets the release tarball, after its sha256 checksum is checked. The governor's default config allows 1850 MHz, so `gov install` offers to cap it at 1500 MHz first.
+- **Installing:** Fedora gets the [COPR package](https://copr.fedorainfracloud.org/coprs/filippor/bazzite/), Bazzite and other rpm-ostree systems get it layered (then reboot and run `gov install` again), and Arch gets the AUR package through `paru` or `yay`.
+  - Debian/Ubuntu get the `.deb`, and anything else gets the tarball, both from the author's release v0.4.9 (pinned; `GOV_TAG=` picks another).
+  - The tarball is checked against the release's sha256 file. That catches a broken download but comes from the same place as the tarball. The `.deb` has no published checksum.
+  - The governor's default config allows 1850 MHz, so `gov install` offers to cap it at 1500 MHz first.
 - **How the tuner works:** the governor has a test mode (a root-only D-Bus call) that holds the GPU at one clock and voltage. The tuner uses it to step the clock up, taking each step's voltage from your own curve, and runs the same checks as `cu test` at each step: GPU results compared against the CPU, GPU errors in the kernel log, hangs, and the temperature limit. The first failure ends the run. The recommended limit is one step below the highest clock that held, and it's only applied if you agree.
-- **Undervolting** holds one clock and steps the voltage down 10 mV at a time. The lowest stable voltage plus 20 mV is offered as the new point on the curve. The curve is kept valid, so voltage never drops as the clock rises.
+- **Undervolting** holds one point of the curve and steps its voltage down 10 mV at a time. Lowering one point also lowers the voltage of every clock between it and the points either side, because the governor interpolates. So before anything is saved, the clocks halfway to each neighbour are tested at their new voltages. The lowest stable voltage plus 20 mV is then offered as the new point, and the curve is kept valid (voltage never drops as the clock rises). After a curve change, run `gov tune` again, since earlier results were measured on the old curve.
 - **Safety:**
-  - The tuner never asks for more than 1050 mV, or a clock beyond the top of your curve, unless you pass `--force`.
+  - The tuner never asks for more than 1050 mV, or a clock beyond the top of your curve, unless you pass `--force`. It refuses to run without a readable GPU temperature sensor, or with `--temp-limit` above 95 °C, because the governor's own throttling is off in test mode.
+  - Voltages are calculated exactly the way the governor does, so what's tested is what it will use.
   - Overheating ends test mode immediately.
   - Every exit (finishing, an error, Ctrl-C) restarts the governor, which ends test mode and reloads the config.
-  - If a step freezes the board, the next run marks it failed and stops below it.
+  - If a step freezes the board, including during the switch to a new clock, the next run marks it failed and tests nothing at or above that clock, whatever the step size. `--retest-frozen` overrides this.
+  - A step only counts as passed if the governor held the test clock throughout. If the governor restarts mid-step or rejects the D-Bus call, the run stops with no recommendation, rather than blaming the clock.
   - gpu-yield is paused during tuning, so no AI request runs at an untested clock. `--ollama-load` keeps Ollama running as a more realistic heat load instead.
 - **Tune at the CU setting you'll actually run.** More compute units at the same clock means more heat, so unlock CUs first, then tune the clock.
 
@@ -115,7 +121,7 @@ sudo bc250-fixer gov undervolt  # optional: less voltage at 1500 MHz = less heat
 - **Kernel boot options** go through whatever your system uses: rpm-ostree, grubby, kernelstub, `/etc/kernel/cmdline`, or `/etc/default/grub` plus `update-grub`/`grub-mkconfig`.
 - **Swap:** the swapfile goes at `/var/swap/swapfile` and gets an `/etc/fstab` line. On btrfs it uses `btrfs filesystem mkswapfile`. The SELinux label is set when SELinux is on.
 - **zram:** the limit is written to `/etc/systemd/zram-generator.conf`.
-- **Governor:** the config is backed up as `config.toml.bc250-fixer.bak` before the first change. `gov restore` puts it back. Edits keep its comments and layout, and are checked before they're written.
+- **Governor:** the config is backed up as `config.toml.bc250-fixer.bak` before the first change. `gov restore` puts it back. Edits keep its comments and layout, are checked before they're written, and replace the file in one step, so a crash can't leave it half-written.
 - **CMOS:** a backup of the block is saved in `/var/lib/bc250-fixer/`. Clearing CMOS restores the factory settings.
 - **Compute units:** a live change ends at reboot unless you persist it. `cu unpersist` removes the boot service.
 - **State and tools:** these live in `/var/lib/bc250-fixer` and `/opt/bc250-fixer`; `uninstall purge` removes both.
@@ -131,7 +137,7 @@ sudo bc250-fixer gov undervolt  # optional: less voltage at 1500 MHz = less heat
 
 - **`vram`:** the diagnosis and CMOS fix were confirmed on a real BC-250 (P3.00 firmware: 7.5 → 14.8 GiB after one reboot). The write was also checked byte for byte against the upstream C tool.
 - **Everything else** is tested against a simulated board: fake routing registers, a fake verifier with planted faults, a fake journal, Ollama and systemd. The parts that touch real hardware are the community tools' work.
-- **`gov`** is tested against a simulated governor: a fake D-Bus test mode and a verifier that fails above a set clock or below a set voltage. The config editor was tested on the governor's real default configs.
+- **`gov`** is tested against a simulated governor: a fake D-Bus test mode, and a verifier that fails above a set clock or below a set voltage. The simulation also covered freezes, a failing D-Bus call, governor restarts mid-step and failing neighbour clocks. The config editor was tested on the governor's real default configs, and the module had its own independent review; each finding was fixed and re-tested.
 - **The risky parts were reviewed by a second agent:** boot options, CMOS, swap/fstab, boot persistence and dry-run. Each issue it found has a test that now passes. Two examples: the GRUB editor keeps comments and quoting and checks its result before writing, and nothing is written when an edit fails.
 - **First run on your board:** start with `check` and `--dry-run`, and if something looks wrong, [open an issue](https://github.com/AnonyMap/bc250-fixer/issues) with the `report` bundle.
 
