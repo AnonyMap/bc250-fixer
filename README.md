@@ -3,13 +3,35 @@
 One script for the things that go wrong when you use a BC-250 for local AI. It checks the board, fixes common setup problems, sets up the GPU clock governor and finds the highest clock your board runs reliably, unlocks and tests the extra GPU compute units, and collects a support bundle when you need help.
 
 ```bash
-curl -LO https://raw.githubusercontent.com/AnonyMap/bc250-fixer/main/bc250-fixer
-chmod +x bc250-fixer
-sudo ./bc250-fixer install     # optional: puts it at /usr/local/sbin/bc250-fixer
+curl -fsSL https://raw.githubusercontent.com/AnonyMap/bc250-fixer/main/install.sh | sudo bash
 sudo bc250-fixer check         # read-only health check
 sudo bc250-fixer fix --dry-run # see what it would change
 sudo bc250-fixer fix           # fix it (asks before each change)
 ```
+
+## Install
+
+The one-liner above puts `bc250-fixer` in `/usr/local/sbin`. Run it again to update.
+
+- **How it checks the download:** it downloads to a temporary file and checks it before installing. The file must be the tool, complete (not cut off), valid bash, and must run. All of the installer's code is in one function that's only called on its last line, so a broken download of the installer runs nothing.
+- **Options** go after `bash -s --`:
+  - `--ref NAME` installs a tag or branch instead of `main`.
+  - `--prefix DIR` puts it in another directory.
+  - `--check` runs a health check straight after.
+  - `--uninstall` removes it.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AnonyMap/bc250-fixer/main/install.sh | sudo bash -s -- --check
+```
+
+- **To read it before running it:**
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/AnonyMap/bc250-fixer/main/install.sh
+less install.sh && sudo bash install.sh
+```
+
+- **Without the installer:** download `bc250-fixer` itself, `chmod +x` it, and run it from anywhere. `sudo ./bc250-fixer install` copies it to `/usr/local/sbin`.
 
 ## The most common problem: Linux sees only ~7.5 GB
 
