@@ -1,0 +1,2072 @@
+#!/usr/bin/env bash
+# bc250-fixer: maintenance toolkit for the AMD BC-250 board (Cyan Skillfish APU) used for local AI.
+# https://github.com/AnonyMap/bc250-fixer
+#
+#   check                 full read-only health check; saves a report
+#   fix [ITEM...]         guided fixes for what check finds (asks before each change)
+#                         items: journal pages-limit iommu vram swap zram (default: all)
+#   vram [check|fix [MB]] the CPU/GPU memory split (why Linux sees ~7.5 GB instead of ~15)
+#   headless on|off|status   boot without a desktop (frees ~0.6-1 GB)
+#   cu <command>          GPU compute units (24 of 40 enabled at the factory):
+#        setup            install umr and the test tools
+#        status           routing, temperatures, clock cap, results, persistence
+#        test [WGP...]    test each extra CU pair alone, then a soak of the passing ones
+#        apply N|passing|all|stock|WGP...   change it now (N = CU count, 24-40 in pairs)
+#        bench            Ollama reading/writing speed: stock vs unlocked
+#        persist | unpersist   apply at every boot (with a crash-loop guard) / stop
+#   cpu unlock | test [SECONDS]   the 2 disabled CPU cores (6 -> 8), and a verified stress test
+#   soak [MINUTES]        stability soak at the current settings (GPU correctness, heat, kernel log)
+#   monitor               live clocks, temperatures, power and memory (Ctrl-C to stop)
+#   llama build | bench MODEL.gguf   build llama.cpp with Vulkan; benchmark a model
+#   report                support bundle for asking for help (hostname, MACs and IPs blanked)
+#   install | uninstall   put this tool at /usr/local/sbin/bc250-fixer / remove it
+#
+# Global flags (anywhere on the command line):
+#   -y, --yes       answer yes to every question       -n, --dry-run   show changes, make none
+#   --force         skip safety refusals (not the hardware checks of other boards' IDs)
+#   --no-color      plain output                       --out DIR       where reports are saved
+# Command flags:
+#   --passes N --rounds N --soak-minutes N --temp-limit C --model NAME   (cu test, soak, bench)
+#   --size GB (fix swap)  --interval S --count N --log FILE.csv (monitor)  --llama-dir DIR
+#
+# Run as root (sudo) except for help, monitor and llama build/bench.
+# Changes that need a reboot say so. Every file it edits is backed up next to itself as *.bc250-fixer.bak.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+INSTALL_PATH="${INSTALL_PATH:-/usr/local/sbin/bc250-fixer}"
+
+# ---------- settings (flags override, then environment, then these defaults) ----------
+PASSES="${PASSES:-4}"
+ROUNDS="${ROUNDS:-2}"
+SOAK_MINUTES="${SOAK_MINUTES:-10}"
+TEMP_LIMIT="${TEMP_LIMIT:-92}"
+MODEL="${MODEL:-}"
+BENCH_RUNS="${BENCH_RUNS:-2}"
+BENCH_LINES="${BENCH_LINES:-60}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-600}"
+SWAP_GB="${SWAP_GB:-16}"
+INTERVAL="${INTERVAL:-2}"
+COUNT="${COUNT:-0}"
+MONLOG="${MONLOG:-}"
+OUT_DIR="${OUT_DIR:-$PWD}"
+LLAMA_DIR="${LLAMA_DIR:-}"
+FORCE="${FORCE:-0}"
+YES=0 DRY=0 NOCOLOR=0
+
+STATE="${STATE:-/var/lib/bc250-fixer}"
+TOOLS="${TOOLS:-/opt/bc250-fixer}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+OLLAMA="${OLLAMA:-http://127.0.0.1:11434}"
+GY_STATUS="${GY_STATUS:-http://127.0.0.1:11435/status}"
+
+GOOD_PAGES_LIMIT=4194304
+MIN_LLAMA_BUILD=9265
+LM_REPO="https://github.com/WinnieLV/bc250-cu-live-manager"
+LM_COMMIT="a929085d791f126ce76a60eb609610820fb08066"
+DG_REPO="https://github.com/duggasco/bc250-40cu-unlock"
+DG_COMMIT="ae7c30c78e253a5e2c6af0e9c090f807b825191c"
+LM="${LM:-$TOOLS/live/bc250-cu-live-manager.sh}"
+VERIFY="${VERIFY:-$TOOLS/duggasco/scripts/bc250-compute-verify.sh}"
+CMOS_PORT="${CMOS_PORT:-/dev/port}"
+
+# ---------- argument parsing: global flags may appear anywhere ----------
+ARGS=()
+need_val() { [[ $# -ge 2 && -n $2 ]] || { echo "option $1 needs a value" >&2; exit 2; }; }
+while (( $# )); do
+  _eq=0
+  if [[ $1 == --*=* ]]; then set -- "${1%%=*}" "${1#*=}" "${@:2}"; _eq=1; fi
+  case $1 in
+    -y|--yes|-n|--dry-run|--force|--no-color)
+      (( _eq == 0 )) || { echo "$1 doesn't take a value (use it on its own)" >&2; exit 2; } ;;&
+    -y|--yes) YES=1 ;;
+    -n|--dry-run) DRY=1 ;;
+    --force) FORCE=1 ;;
+    --no-color) NOCOLOR=1 ;;
+    --out) need_val "$@"; OUT_DIR="$2"; shift ;;
+    --passes) need_val "$@"; PASSES="$2"; shift ;;
+    --rounds) need_val "$@"; ROUNDS="$2"; shift ;;
+    --soak-minutes) need_val "$@"; SOAK_MINUTES="$2"; shift ;;
+    --temp-limit) need_val "$@"; TEMP_LIMIT="$2"; shift ;;
+    --model) need_val "$@"; MODEL="$2"; shift ;;
+    --size) need_val "$@"; SWAP_GB="$2"; shift ;;
+    --interval) need_val "$@"; INTERVAL="$2"; shift ;;
+    --count) need_val "$@"; COUNT="$2"; shift ;;
+    --log) need_val "$@"; MONLOG="$2"; shift ;;
+    --llama-dir) need_val "$@"; LLAMA_DIR="$2"; shift ;;
+    -h|--help) ARGS+=(help) ;;
+    -V|--version) ARGS+=(version) ;;
+    --) shift; ARGS+=("$@"); break ;;
+    -*) echo "unknown option '$1' (try: bc250-fixer help)" >&2; exit 2 ;;
+    *) ARGS+=("$1") ;;
+  esac
+  shift
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+for _v in PASSES ROUNDS SOAK_MINUTES TEMP_LIMIT BENCH_RUNS BENCH_LINES VERIFY_TIMEOUT SWAP_GB INTERVAL; do
+  [[ ${!_v} =~ ^[0-9]+$ && ${!_v} -gt 0 ]] || { echo "$_v must be a whole number above 0 (got '${!_v}')" >&2; exit 2; }
+done
+[[ $COUNT =~ ^[0-9]+$ ]] || { echo "--count must be a whole number" >&2; exit 2; }
+SOAK_SECONDS="${SOAK_SECONDS:-$(( SOAK_MINUTES * 60 ))}"
+
+# ---------- output ----------
+if [[ -t 1 && $NOCOLOR == 0 ]]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' B=$'\e[1;36m' D=$'\e[2m' N=$'\e[0m'
+else R="" G="" Y="" B="" D="" N=""; fi
+FAILS=(); WARNS=(); PASSES_N=0
+pass()    { printf '%s[PASS]%s %s\n' "$G" "$N" "$*"; PASSES_N=$(( PASSES_N + 1 )); }
+ok()      { printf '%s[ OK ]%s %s\n' "$G" "$N" "$*"; }
+warn()    { printf '%s[WARN]%s %s\n' "$Y" "$N" "$*"; WARNS+=("$*"); }
+fail()    { printf '%s[FAIL]%s %s\n' "$R" "$N" "$*"; FAILS+=("$*"); }
+did()     { if (( DRY )); then printf '%s[dry-run]%s would be done: %s\n' "$Y" "$N" "$*"; else ok "$@"; fi; }
+info()    { printf '       %s%s%s\n' "$D" "$*" "$N"; }
+section() { printf '\n%s== %s ==%s\n' "$B" "$*" "$N"; }
+die()     { printf '\n%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+have()    { command -v "$1" >/dev/null 2>&1; }
+gib()     { awk -v b="$1" 'BEGIN{printf "%.1f", b/1073741824}'; }
+GiB=1073741824
+strip_color() { sed -u 's/\x1b\[[0-9;]*m//g'; }
+
+# ask: --yes answers yes; --dry-run answers yes so every would-be change is shown.
+ask() {
+  if (( DRY )); then printf '  %s [dry-run: yes]\n' "$1"; return 0; fi
+  if (( YES )); then printf '  %s [--yes]\n' "$1"; return 0; fi
+  [[ -t 0 ]] || { printf '  %s [no terminal to ask: no]\n' "$1"; return 1; }
+  local a; read -r -p "  $1 [y/N] " a; [[ $a == [yY]* ]]
+}
+# act: run a command that changes the system, or show it under --dry-run.
+act() { if (( DRY )); then printf '  %s[dry-run]%s %s\n' "$Y" "$N" "$*"; else "$@"; fi; }
+# backup FILE: keep the first original as FILE.bc250-fixer.bak
+backup() { [[ -f $1 && ! -f $1.bc250-fixer.bak ]] && act cp -p "$1" "$1.bc250-fixer.bak"; return 0; }
+# write_file FILE (content on stdin): back up, then replace
+write_file() {
+  local f="$1" content; content="$(cat)"
+  [[ -n $content ]] || { fail "refusing to write an empty $f"; return 1; }
+  if (( DRY )); then printf '  %s[dry-run]%s would write %s:\n' "$Y" "$N" "$f"; printf '%s\n' "$content" | sed 's/^/      | /'; return 0; fi
+  backup "$f"; mkdir -p "$(dirname "$f")"; printf '%s\n' "$content" >"$f"
+}
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "this needs root: sudo bc250-fixer ${*:-$CMD}"; }
+no_dry() { (( DRY == 0 )) || die "'$*' can't run as a dry run: it only makes sense for real"; }
+
+USER_NAME="${SUDO_USER:-${USER:-root}}"
+USER_HOME=$(getent passwd "$USER_NAME" 2>/dev/null | cut -d: -f6); USER_HOME=${USER_HOME:-$HOME}
+as_user() {   # run a command as the invoking user when started with sudo
+  if [[ ${EUID:-$(id -u)} -eq 0 && -n ${SUDO_USER:-} ]]; then runuser -u "$SUDO_USER" -- env HOME="$USER_HOME" "$@"
+  else "$@"; fi
+}
+boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown; }
+ver2num() { local v="${1%%[-+_ ]*}" a b c; IFS=. read -r a b c <<<"$v"
+            a=${a//[!0-9]/}; b=${b//[!0-9]/}; c=${c//[!0-9]/}
+            echo $(( 10#${a:-0}*1000000 + 10#${b:-0}*1000 + 10#${c:-0} )); }
+
+is_bc250() {
+  [[ $FORCE == 1 ]] && return 0
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [[ "$(cat "$d/vendor" 2>/dev/null)" == 0x1002 && "$(cat "$d/device" 2>/dev/null)" == 0x13fe ]] && return 0
+  done
+  have lspci && lspci -nn 2>/dev/null | grep -qi '1002:13fe'
+}
+gpu_card() {   # sysfs device dir of the AMD GPU
+  [[ -n ${GPU_CARD:-} ]] && { echo "$GPU_CARD"; return 0; }
+  local d
+  for d in /sys/class/drm/card[0-9]*; do
+    [[ $d == *-* ]] && continue
+    [[ "$(cat "$d/device/vendor" 2>/dev/null)" == 0x1002 ]] && { echo "$d/device"; return 0; }
+  done
+  return 1
+}
+hwmon_by_name() { local h; for h in /sys/class/hwmon/hwmon*; do [[ "$(cat "$h/name" 2>/dev/null)" == "$1" ]] && { echo "$h"; return 0; }; done; return 1; }
+pkg_mgr() {
+  if [[ -e /run/ostree-booted ]]; then echo rpm-ostree
+  elif have dnf; then echo dnf
+  elif have pacman; then echo pacman
+  elif have apt-get; then echo apt
+  else echo none; fi
+}
+pkg_install() {   # generic name list per manager; caller passes per-manager lists
+  local mgr; mgr=$(pkg_mgr)
+  case $mgr in
+    dnf) act dnf install -y "$@" ;;
+    pacman) act pacman -S --needed --noconfirm "$@" ;;
+    apt) act apt-get update -qq; act env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    rpm-ostree) act rpm-ostree install --idempotent --allow-inactive "$@" && warn "rpm-ostree layered the packages: reboot before continuing" ;;
+    *) die "no supported package manager (dnf, rpm-ostree, pacman, apt); install by hand: $*" ;;
+  esac
+}
+
+# =====================================================================================
+# check: read-only health check (from the project's bc250-check.sh)
+# =====================================================================================
+# shellcheck disable=SC2120  # called with "$@" through with_report
+cmd_check() {
+  printf '%sBC-250 health check%s (bc250-fixer %s), %s\n' "$B" "$N" "$VERSION" "$(date)"
+  info "Host: $(hostname)   Uptime: $(uptime -p 2>/dev/null)"
+  [ "${EUID:-$(id -u)}" -ne 0 ] && warn "Not running as root: previous-boot kernel logs may be hidden. Re-run with sudo for the crash analysis."
+
+  # ---------------------------------------------------------------- system
+  section "System"
+  [ -r /etc/os-release ] && . /etc/os-release && info "OS: ${PRETTY_NAME:-unknown}"
+  local KVER KN
+  KVER=$(uname -r); KN=$(ver2num "$KVER")
+  info "Kernel: $KVER"
+  if   { [ "$KN" -ge 6015000 ] && [ "$KN" -le 6015006 ]; } || { [ "$KN" -ge 6017008 ] && [ "$KN" -le 6017010 ]; }; then
+    fail "Kernel $KVER is in a known-bad range for BC-250 (6.15.0-6.15.6, 6.17.8-6.17.10). Use 6.19.x or 6.18.18+ LTS."
+  elif [ "$KN" -lt 6012000 ]; then warn "Kernel $KVER is old. Use 6.19.x or 6.18.18+ LTS."
+  elif [ "$KN" -lt 6018000 ]; then warn "Kernel $KVER works but is behind the recommended 6.18.18+ LTS / 6.19.x."
+  else pass "Kernel $KVER is in the recommended range"; fi
+  info "Cmdline: $(cat /proc/cmdline)"
+
+  local CPUGOV
+  CPUGOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+  if [ -z "$CPUGOV" ]; then info "CPU frequency governor: not exposed (ACPI fix not installed?)"
+  elif [ "$CPUGOV" = performance ]; then pass "CPU governor: performance"
+  else warn "CPU governor is '$CPUGOV': 'performance' avoids LLM latency spikes"; fi
+
+  # ---------------------------------------------------------------- GPU
+  section "GPU & drivers"
+  local CARD="" DEVID VK MESA
+  CARD=$(gpu_card || true)
+  if [ -z "$CARD" ]; then fail "No AMD GPU found under /sys/class/drm: amdgpu driver may not be loaded"
+  else
+    DEVID=$(cat "$CARD/device" 2>/dev/null)
+    if [ "$DEVID" = "0x13fe" ]; then pass "BC-250 GPU detected (Cyan Skillfish, $DEVID) at ${CARD%/device}"
+    else warn "AMD GPU found but device id is $DEVID, not BC-250's 0x13fe"; fi
+  fi
+  if have vulkaninfo; then
+    VK=$(vulkaninfo --summary 2>/dev/null)
+    if grep -qi 'GFX1013' <<<"$VK"; then pass "Vulkan sees the GPU: $(grep -m1 -i 'deviceName' <<<"$VK" | sed 's/.*= *//')"
+    elif grep -qi llvmpipe <<<"$VK"; then fail "Vulkan only sees llvmpipe (software rendering): inference will run on the CPU. Check Mesa/RADV install."
+    else warn "Couldn't identify the GPU in vulkaninfo output"; fi
+    MESA=$(grep -oiE 'Mesa [0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$VK" | head -1 | awk '{print $2}')
+    if [ -n "$MESA" ]; then
+      if [ "$(ver2num "$MESA")" -lt 25001000 ]; then warn "Mesa $MESA is older than 25.1: Vulkan flash attention needs 25.1+"
+      else pass "Mesa $MESA (flash attention supported)"; fi
+    fi
+  else
+    warn "vulkaninfo not installed (package: vulkan-tools): can't verify the Vulkan driver"
+  fi
+  if grep -qE '(amd_iommu|iommu)=off' /proc/cmdline; then pass "IOMMU disabled via kernel cmdline"
+  elif [ -n "$(ls -A /sys/class/iommu 2>/dev/null)" ]; then fail "IOMMU is enabled: disable it in BIOS, or: sudo bc250-fixer fix iommu"
+  else pass "IOMMU disabled"; fi
+  [ -d /opt/rocm ] && warn "ROCm is installed (/opt/rocm). Newer ROCm can hard-freeze this board: make sure nothing uses it; use Vulkan."
+  if grep -rqs HSA_OVERRIDE_GFX_VERSION /etc/environment /etc/profile.d "$USER_HOME/.bashrc" "$USER_HOME/.profile" 2>/dev/null \
+     || systemctl show ollama -p Environment --value 2>/dev/null | grep -q HSA_OVERRIDE; then
+    fail "HSA_OVERRIDE_GFX_VERSION is set somewhere: masquerading as gfx1030 risks silent wrong results and freezes. Remove it."
+  fi
+
+  # ---------------------------------------------------------------- memory
+  section "Memory configuration (the usual reason models fail or 'crash')"
+  local PL PPS PLG GTT GTTU VRAM RAMB
+  PL=$(cat /sys/module/ttm/parameters/pages_limit 2>/dev/null)
+  PPS=$(cat /sys/module/ttm/parameters/page_pool_size 2>/dev/null)
+  if [ -z "$PL" ]; then warn "Can't read ttm pages_limit"
+  else
+    PLG=$(gib $((PL*4096)))
+    if   [ "$PL" -ge 4194304 ]; then pass "ttm pages_limit = $PL (${PLG} GiB)"
+    elif [ "$PL" -ge 3959290 ]; then pass "ttm pages_limit = $PL (${PLG} GiB, community value: fine)"
+    else fail "ttm pages_limit = $PL (only ${PLG} GiB). GPU memory is capped: larger models load, then fail or hang mid-generation. Fix: sudo bc250-fixer fix pages-limit"; fi
+    info "ttm page_pool_size = ${PPS:-?}"
+  fi
+  if [ -n "$CARD" ] && [ -r "$CARD/mem_info_gtt_total" ]; then
+    GTT=$(cat "$CARD/mem_info_gtt_total"); GTTU=$(cat "$CARD/mem_info_gtt_used" 2>/dev/null || echo 0)
+    VRAM=$(cat "$CARD/mem_info_vram_total" 2>/dev/null || echo 0)
+    RAMB=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)
+    info "BIOS VRAM carve-out: $(gib "$VRAM") GiB   Linux-visible RAM: $(gib "$RAMB") GiB"
+    if [ "$VRAM" -gt 1100000000 ] && [ "$RAMB" -lt 10000000000 ]; then
+      fail "The firmware splits the 16 GB into $(gib "$VRAM") GiB fixed VRAM + $(gib "$RAMB") GiB for Linux. The OS, model loading and GTT all share that small half, so models over ~7 GB trigger OOM kills and freezes, and pages_limit can't help. Diagnose and fix from Linux: sudo bc250-fixer vram"
+    elif [ "$GTT" -ge 15000000000 ]; then pass "GTT (GPU-addressable memory) = $(gib "$GTT") GiB, $(gib "$GTTU") GiB in use"
+    else fail "GTT is only $(gib "$GTT") GiB: models are limited to about half the board's memory"; fi
+    [ "$VRAM" -gt 1100000000 ] && [ "$RAMB" -ge 10000000000 ] && warn "Static VRAM carve-out of $(gib "$VRAM") GiB. For LLMs, 512 MB + GTT is the recommended setup (sudo bc250-fixer vram fix)."
+  fi
+
+  # conflicting pages_limit settings (tmpfiles.d silently wins last)
+  local -A SRC=()
+  local v f line k
+  v=$(grep -oE 'ttm\.pages_limit=[0-9]+' /proc/cmdline | cut -d= -f2); [ -n "$v" ] && SRC[cmdline]=$v
+  while IFS=: read -r f line; do v=$(grep -oE 'pages_limit=[0-9]+' <<<"$line" | cut -d= -f2); [ -n "$v" ] && SRC[$f]=$v
+  done < <(grep -rsH --include='*.conf' 'pages_limit' /etc/modprobe.d 2>/dev/null)
+  while IFS=: read -r f line; do
+    [[ $f == /usr/lib/* && -e /etc/tmpfiles.d/$(basename "$f") ]] && continue   # overridden by /etc
+    v=$(awk '{print $NF}' <<<"$line"); [[ "$v" =~ ^[0-9]+$ ]] && SRC[$f]=$v
+  done < <(grep -rsH --include='*.conf' 'ttm/parameters/pages_limit' /etc/tmpfiles.d /usr/lib/tmpfiles.d 2>/dev/null)
+  if [ ${#SRC[@]} -gt 0 ]; then
+    for k in "${!SRC[@]}"; do info "pages_limit set in $k = ${SRC[$k]}"; done
+    [ "$(printf '%s\n' "${SRC[@]}" | sort -u | wc -l)" -gt 1 ] && \
+      warn "pages_limit is set to DIFFERENT values in different places. tmpfiles.d runs last and wins. Make them match: sudo bc250-fixer fix pages-limit"
+  fi
+  grep -q 'amdgpu.gttsize' /proc/cmdline && warn "amdgpu.gttsize is on the kernel cmdline. It's deprecated; ttm.pages_limit alone gives a larger GTT (sudo bc250-fixer fix pages-limit removes it)."
+
+  local MEMT MEMA DISKSWAP ZRAMT TARGET z
+  MEMT=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo); MEMA=$(awk '/MemAvailable/{print $2*1024}' /proc/meminfo)
+  info "RAM: $(gib "$MEMT") GiB total, $(gib "$MEMA") GiB available right now"
+  ZRAMT=0; for z in /sys/block/zram*/disksize; do [ -r "$z" ] && ZRAMT=$((ZRAMT + $(cat "$z"))); done
+  DISKSWAP=$(awk 'NR>1 && $1 !~ /zram/ {s+=$3} END{print s*1024+0}' /proc/swaps)
+  if [ "$DISKSWAP" -ge 8000000000 ]; then pass "Disk swap: $(gib "$DISKSWAP") GiB"
+  else warn "Disk swap is only $(gib "$DISKSWAP") GiB: add a swapfile as a safety net for inference peaks (sudo bc250-fixer fix swap)"; fi
+  [ "$ZRAMT" -gt 4294967296 ] && warn "zram is $(gib "$ZRAMT") GiB: zram lives in physical RAM and competes with the model. Shrink to ~2 GiB (sudo bc250-fixer fix zram)."
+  [ "$ZRAMT" -gt 0 ] && [ "$ZRAMT" -le 4294967296 ] && info "zram: $(gib "$ZRAMT") GiB (ok)"
+  TARGET=$(systemctl get-default 2>/dev/null)
+  if [ "$TARGET" = graphical.target ]; then warn "Booting to a desktop. Headless frees ~0.6-1 GB for models (sudo bc250-fixer headless on)."
+  else pass "Default boot target: ${TARGET:-unknown}"; fi
+
+  # ---------------------------------------------------------------- governor
+  section "GPU clock governor & compute units"
+  local GOV_ACTIVE="" GOV_MAXF=0 svc INST cfg PAIRS MINMV TOP CUS CC CU40=0
+  for svc in cyan-skillfish-governor-smu cyan-skillfish-governor oberon-governor; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then GOV_ACTIVE=$svc; break; fi
+  done
+  if [ -n "$GOV_ACTIVE" ]; then pass "GPU governor running: $GOV_ACTIVE"
+  else
+    INST=$(systemctl list-unit-files 2>/dev/null | grep -oE '(cyan-skillfish-governor(-smu)?|oberon-governor)\.service' | head -1)
+    if [ -n "$INST" ]; then fail "GPU governor installed ($INST) but NOT running. Check: journalctl -u ${INST%.service}"
+    else fail "No GPU governor installed. Install cyan-skillfish-governor-smu: it is the only working clock/voltage control on this GPU."; fi
+  fi
+  for cfg in /etc/cyan-skillfish-governor-smu/config.toml /etc/cyan-skillfish-governor/config.toml; do
+    [ -r "$cfg" ] || continue
+    info "Config: $cfg"
+    awk '/^\[frequency-range\]/{f=1;next} /^\[/{f=0} f' "$cfg" | grep -qi 'mhz' && \
+      fail "'MHz' suffix inside [frequency-range] in $cfg: this breaks the parser. Use bare numbers."
+    PAIRS=$(grep -oE '\[ *[0-9]{3,4} *, *[0-9]{3,4} *\]' "$cfg" | tr -d '[] ')
+    if [ -n "$PAIRS" ]; then
+      MINMV=$(cut -d, -f2 <<<"$PAIRS" | sort -n | head -1)
+      TOP=$(sort -t, -k1,1n <<<"$PAIRS" | tail -1); GOV_MAXF=${TOP%,*}
+      if [ "$MINMV" -lt 700 ]; then fail "A governor voltage point is ${MINMV} mV: below 700 mV locks the GPU to 1500 MHz"
+      else pass "Lowest governor voltage point: ${MINMV} mV"; fi
+      info "Highest point: ${GOV_MAXF} MHz @ ${TOP#*,} mV  (stable baseline: 1500 MHz @ 900 mV)"
+    fi
+  done
+  [ -n "$CARD" ] && [ -r "$CARD/pp_dpm_sclk" ] && info "Current GPU clock: $(grep '\*' "$CARD/pp_dpm_sclk" | awk '{print $2}')"
+  CUS=$( { dmesg 2>/dev/null; journalctl -k -b 0 --no-pager 2>/dev/null; } | grep -oE 'active_cu_number[ :=]*[0-9]+' | grep -oE '[0-9]+$' | tail -1)
+  CC=$(cat /sys/module/amdgpu/parameters/bc250_cc_write_mode 2>/dev/null)
+  info "Active compute units at boot: ${CUS:-unknown}${CC:+   (bc250_cc_write_mode=$CC)}"
+  [ "$CUS" = 40 ] && { CU40=1; info "40-CU unlock is active: more heat/power, and the first suspect if you see GPU ring timeouts"; }
+  [ -s "$STATE/cu/results.tsv" ] && info "Compute-unit test results on record: sudo bc250-fixer cu status"
+  [ "${CUS:-24}" = 24 ] && info "Only 24 of 40 CUs are used. Test and enable more: sudo bc250-fixer cu setup && sudo bc250-fixer cu test"
+
+  # ---------------------------------------------------------------- thermals
+  section "Thermals & power (snapshot: at idle unless something is running)"
+  local FANS=0 SPIN=0 h nm t raw lbl fn rpm p
+  for h in /sys/class/hwmon/hwmon*; do
+    nm=$(cat "$h/name" 2>/dev/null)
+    for t in "$h"/temp*_input; do
+      [ -r "$t" ] || continue
+      raw=$(cat "$t" 2>/dev/null) || continue; v=$((raw/1000))
+      lbl=$(cat "${t%_input}_label" 2>/dev/null || basename "$t" _input)
+      if [ "$v" -le 0 ] || [ "$v" -ge 120 ]; then continue; fi
+      if   [ "$v" -ge 95 ]; then fail "$nm/$lbl at ${v}°C (critical)"
+      elif [ "$v" -ge 85 ]; then warn "$nm/$lbl at ${v}°C (hot)"
+      else info "$nm/$lbl: ${v}°C"; fi
+    done
+    for fn in "$h"/fan*_input; do
+      [ -r "$fn" ] || continue; rpm=$(cat "$fn" 2>/dev/null); FANS=$((FANS+1))
+      [ "${rpm:-0}" -gt 0 ] && { SPIN=$((SPIN+1)); info "$nm/$(basename "$fn" _input): ${rpm} RPM"; }
+    done
+  done
+  [ "$FANS" -gt 0 ] && [ "$SPIN" -eq 0 ] && warn "Fan headers found but none report spinning: check the heatsink fan"
+  if [ -n "$CARD" ]; then
+    for p in "$CARD"/hwmon/hwmon*/power1_average; do [ -r "$p" ] && info "GPU/SoC power: $(awk -v x="$(cat "$p")" 'BEGIN{printf "%.0f", x/1e6}') W"; done
+  fi
+  info "Note: the GDDR6 chips on the back of the board have NO sensor: none of the numbers above cover them."
+
+  # ---------------------------------------------------------------- crash logs
+  section "Crash history (kernel logs from recent boots)"
+  if [ -n "$(ls -A /var/log/journal 2>/dev/null)" ]; then pass "Journal is persistent (crash logs survive reboots)"
+  else fail "Journal is NOT persistent: every crash log is erased on reboot, so crashes can't be diagnosed. Fix: sudo bc250-fixer fix journal"; fi
+  local T_HANG=0 T_OOM=0 T_MEM=0 T_MCE=0 T_ABR=0 T_ABRM=0 T_VMF=0 SAMPLES="" off KL APP hang oom vmf mem mce when ended MSG
+  local -a BOOTS
+  mapfile -t BOOTS < <(journalctl --list-boots --no-pager 2>/dev/null | awk '$1 ~ /^-?[0-9]+$/ {print $1}' | tail -n 6)
+  if [ ${#BOOTS[@]} -eq 0 ]; then warn "No boot history readable (run with sudo)"; fi
+  for off in "${BOOTS[@]}"; do
+    KL=$(journalctl -k -b "$off" --no-pager 2>/dev/null)
+    APP=$(journalctl -u ollama -u llama-server -u llama.cpp -b "$off" --no-pager 2>/dev/null)
+    hang=$(grep -cE 'ring [a-z_]+[0-9.]* timeout|kiq fence|quiesce KFD|device wedged|GPU reset begin|reset failed' <<<"$KL")
+    oom=$(grep -cE 'Out of memory|oom-kill|invoked oom-killer' <<<"$KL")
+    vmf=$(grep -cE 'amdgpu.*(PROTECTION_FAULT|page fault)' <<<"$KL")
+    mem=$(( $(grep -ciE 'amdgpu.*(failed to allocate|ENOMEM)|ttm.*(fail|ENOMEM)' <<<"$KL") + $(grep -ciE 'ErrorOutOfDeviceMemory|out of device memory|status=500|failed to allocate' <<<"$APP") ))
+    mce=$(grep -cE 'Machine check|mce: |Hardware Error' <<<"$KL")
+    when=$(journalctl -b "$off" -n 1 -o short-iso --no-pager 2>/dev/null | tail -1 | cut -d' ' -f1)
+    ended="still running"
+    if [ "$off" != 0 ]; then
+      if journalctl -b "$off" -n 400 --no-pager 2>/dev/null | grep -qE 'systemd-shutdown|Reached target .*(Power-Off|Reboot|Shutdown|Halt)|Journal stopped|reboot: (Restarting|Power down)'; then
+        ended="clean shutdown"
+      elif [ $((oom+mem)) -gt 0 ]; then ended="ABRUPT, right after memory exhaustion"; T_ABRM=$((T_ABRM+1))
+      else ended="ABRUPT, nothing logged first"; T_ABR=$((T_ABR+1)); fi
+    fi
+    info "boot $off (last entry ${when:-?}): gpu-hang=$hang oom=$oom gpu-mem=$mem vm-fault=$vmf mce=$mce, $ended"
+    T_HANG=$((T_HANG+hang)); T_OOM=$((T_OOM+oom)); T_MEM=$((T_MEM+mem)); T_MCE=$((T_MCE+mce)); T_VMF=$((T_VMF+vmf))
+    [ "$hang" -gt 0 ] && SAMPLES+=$(grep -m2 -E 'ring [a-z_]+[0-9.]* timeout|kiq fence|quiesce KFD' <<<"$KL")$'\n'
+  done
+  if [ "$T_HANG" -gt 0 ]; then
+    MSG="GPU hangs logged ($T_HANG events). Usual cause: voltage too low for the clock."
+    [ "$GOV_MAXF" -gt 1500 ] && MSG+=" Your governor goes up to ${GOV_MAXF} MHz: cap it at 1500 MHz @ 900 mV and retest."
+    [ "$CU40" = 1 ] && MSG+=" 40 CUs are unlocked: revert to 24 until stable."
+    MSG+=" If hangs come only after long runs, add heatsinks to the back-side GDDR6 chips."
+    fail "$MSG"
+    printf '%s' "$SAMPLES" | sort -u | head -4 | while read -r l; do [ -n "$l" ] && info "  $l"; done
+  fi
+  [ "$T_MEM" -gt 0 ] && fail "GPU memory allocation failures ($T_MEM). Model + context exceeded the memory cap: check pages_limit above, use a smaller context or q8_0 KV, or a smaller model."
+  [ "$T_OOM" -gt 0 ] && fail "The OOM killer fired ($T_OOM times). System RAM ran out: add disk swap, go headless, reduce context."
+  [ "$T_VMF" -gt 0 ] && warn "GPU page faults logged ($T_VMF). Often follows memory exhaustion or a driver bug; update Mesa/llama.cpp."
+  [ "$T_MCE" -gt 0 ] && fail "CPU machine-check errors ($T_MCE). Points to power delivery or CPU instability: test another PSU, remove any CPU overclock."
+  [ "$T_ABRM" -gt 0 ] && info "$T_ABRM boot(s) ended abruptly right after memory exhaustion: a memory freeze followed by a forced power-off."
+  if [ "$T_ABR" -gt 0 ] && [ "$T_HANG" -eq 0 ]; then
+    if [ "$T_OOM" -gt 0 ] || [ "$T_MEM" -gt 0 ]; then
+      warn "$T_ABR more boot(s) ended abruptly with nothing logged. Given the memory failures above, the likeliest cause is the same memory freeze (with zram and no disk swap the system can lock up before the OOM killer logs anything). If the board switched itself off or rebooted on its own, suspect the PSU instead."
+    else
+      fail "$T_ABR boot(s) ended abruptly with nothing logged first. If the board froze and you held power, suspect a GPU lock; if it switched itself off or rebooted on its own, suspect the PSU (never use 6-pin to 8-pin adapters)."
+    fi
+  elif [ "$T_ABR" -gt 0 ]; then
+    info "$T_ABR boot(s) ended abruptly: consistent with the GPU hangs above."
+  fi
+  [ $((T_HANG+T_OOM+T_MEM+T_MCE+T_ABR+T_ABRM+T_VMF)) -eq 0 ] && [ ${#BOOTS[@]} -gt 0 ] && pass "No crash signatures in the last ${#BOOTS[@]} boot(s)"
+
+  # ---------------------------------------------------------------- software
+  section "Inference software"
+  local LS BUILD RUN OENV
+  LS=$(command -v llama-server 2>/dev/null)
+  [[ "$LS" == */ollama/* ]] && LS=""
+  [ -z "$LS" ] && LS=$(find "$USER_HOME" /opt /usr/local -maxdepth 5 -type f -name llama-server -perm -u+x 2>/dev/null | grep -v '/ollama/' | head -1)
+  if [ -n "$LS" ]; then
+    BUILD=$("$LS" --version 2>&1 | grep -oE 'version: [0-9]+' | grep -oE '[0-9]+' | head -1)
+    [ "$BUILD" = 0 ] && BUILD=""
+    if [ -n "$BUILD" ] && [ "$BUILD" -lt "$MIN_LLAMA_BUILD" ]; then warn "llama.cpp $LS is build b$BUILD: older than b$MIN_LLAMA_BUILD (needed for native MXFP4/gpt-oss and recent Vulkan speedups). Update: bc250-fixer llama build"
+    else pass "llama.cpp found: $LS ${BUILD:+(b$BUILD)}"; fi
+  else
+    info "llama.cpp (llama-server) not found. It's usually faster than Ollama on this board: bc250-fixer llama build"
+  fi
+  RUN=$(pgrep -a llama-server 2>/dev/null | head -1)
+  if [ -n "$RUN" ]; then
+    info "Running: $RUN"
+    grep -qE '(-ctk|--cache-type-k)[ =]q4_0' <<<"$RUN" && warn "Running llama-server with q4_0 K-cache: degrades models with few KV heads (see Models section). Prefer q8_0."
+  fi
+  if have ollama || [ -x "$USER_HOME/.local/opt/ollama/bin/ollama" ]; then
+    OENV=$(systemctl show ollama -p Environment --value 2>/dev/null)
+    if [ -n "$OENV" ]; then
+      grep -q 'OLLAMA_VULKAN=1' <<<"$OENV" || warn "Ollama service doesn't set OLLAMA_VULKAN=1: it may be running on the CPU"
+      grep -q 'OLLAMA_KV_CACHE_TYPE=q4_0' <<<"$OENV" && warn "Ollama uses q4_0 KV cache: prefer q8_0 for models with <=4 KV heads"
+    fi
+    info "Ollama is installed. It runs MoE/MXFP4 models (gpt-oss, Qwen A3B) much slower than llama.cpp on this board."
+  fi
+
+  # ---------------------------------------------------------------- models
+  section "Model files"
+  local -a MODELS
+  if [ $# -gt 0 ]; then MODELS=("$@")
+  else
+    mapfile -t MODELS < <( {
+      find "$USER_HOME" /opt /srv -maxdepth 5 -type f -name '*.gguf' -size +300M 2>/dev/null
+      for d in /usr/share/ollama/.ollama/models/blobs /var/lib/ollama/models/blobs "$USER_HOME/.ollama/models/blobs"; do
+        [ -d "$d" ] && find "$d" -type f -size +300M 2>/dev/null; done
+    } | sort -u | head -n 25 )
+  fi
+  if [ ${#MODELS[@]} -eq 0 ]; then
+    info "No GGUF model files found (pass paths as arguments to check specific ones)"
+  elif ! have python3; then warn "python3 not found: can't inspect model files"
+  else
+    while IFS= read -r l; do
+      case "$l" in
+        "[FAIL] "*) fail "${l:7}";; "[WARN] "*) warn "${l:7}";; "[PASS] "*) pass "${l:7}";; *) info "$l";;
+      esac
+    done < <(python3 -c "$GGUF_PY" "${MODELS[@]}")
+  fi
+
+  # ---------------------------------------------------------------- summary
+  section "Summary"
+  printf '%d passed, %s%d warnings%s, %s%d failures%s\n' "$PASSES_N" "$Y" "${#WARNS[@]}" "$N" "$R" "${#FAILS[@]}" "$N"
+  local i=1 w
+  if [ ${#FAILS[@]} -gt 0 ]; then
+    printf '\n%sFix these first:%s\n' "$R" "$N"; for f in "${FAILS[@]}"; do printf ' %d. %s\n' "$i" "$f"; i=$((i+1)); done
+  fi
+  if [ ${#WARNS[@]} -gt 0 ]; then
+    printf '\n%sThen consider:%s\n' "$Y" "$N"; for w in "${WARNS[@]}"; do printf ' - %s\n' "$w"; done
+  fi
+  [ ${#FAILS[@]} -gt 0 ] && printf '\nMost of these can be fixed with: sudo bc250-fixer fix   (add --dry-run to preview)\n'
+  cat <<'EOF'
+
+Things a script can't check: verify by hand:
+ - PSU: a known-good unit, and NO 6-pin to 8-pin PCIe adapters (they melt).
+ - Heatsinks on the GDDR6 chips on the back of the board (no sensor = no warning before hangs).
+ - Real airflow through the main heatsink (it was designed for a forced-air rack).
+EOF
+}
+
+GGUF_PY=$(cat <<'PY'
+import os, struct, sys
+SC = {0:'B',1:'b',2:'H',3:'h',4:'I',5:'i',6:'f',7:'?',10:'Q',11:'q',12:'d'}
+def rd(f, c):
+    n = struct.calcsize('<' + c); return struct.unpack('<' + c, f.read(n))[0]
+def rs(f):
+    return f.read(rd(f, 'Q')).decode('utf-8', 'replace')
+def rv(f, t):
+    if t in SC: return rd(f, SC[t])
+    if t == 8: return rs(f)
+    if t == 9:
+        et, n = rd(f, 'I'), rd(f, 'Q')
+        if et in SC:
+            sz = struct.calcsize('<' + SC[et])
+            if n > 2048: f.seek(sz * n, 1); return None
+            return list(struct.unpack('<' + SC[et] * n, f.read(sz * n)))
+        if et == 8:
+            if n > 2048:
+                for _ in range(n): f.seek(rd(f, 'Q'), 1)
+                return None
+            return [rs(f) for _ in range(n)]
+        return [rv(f, et) for _ in range(n)]
+    raise ValueError("unknown GGUF type %d" % t)
+def meta(p):
+    with open(p, 'rb') as f:
+        if f.read(4) != b'GGUF': return None
+        if rd(f, 'I') < 2: return None
+        rd(f, 'Q'); nkv = rd(f, 'Q'); m = {}
+        for _ in range(nkv):
+            k = rs(f); v = rv(f, rd(f, 'I'))
+            if not k.startswith('tokenizer.'): m[k] = v
+        return m
+for p in sys.argv[1:]:
+    try: m = meta(p)
+    except Exception as e:
+        print("could not parse %s (%s)" % (p, e)); continue
+    if not m: continue
+    a = m.get('general.architecture', '?')
+    name = m.get('general.name') or os.path.basename(p)
+    kv = m.get(a + '.attention.head_count_kv')
+    if isinstance(kv, list): kv = min([x for x in kv if x] or [0]) or None
+    ex = m.get(a + '.expert_count') or 0; exu = m.get(a + '.expert_used_count') or 0
+    gb = os.path.getsize(p) / 2**30
+    level, notes = 'PASS', []
+    if gb > 13: level = 'FAIL'; notes.append('too big for this board: >13 GiB before any context')
+    elif gb > 11.5: level = 'WARN'; notes.append('tight fit: little room left for context')
+    if kv and kv <= 4:
+        if level == 'PASS': level = 'WARN'
+        notes.append('only %d KV heads: run with -ctk q8_0 -ctv q8_0, NOT q4_0 (q4_0 can wreck output quality)' % kv)
+    kind = 'MoE %s/%s experts active' % (exu, ex) if ex else 'dense'
+    if not ex and gb > 7: notes.append('big dense model = slow generation here; an A3B-style MoE gives similar quality much faster')
+    print("[%s] %s  (%s, %s, %.1f GiB, KV heads: %s)" % (level, name, a, kind, gb, kv or '?'))
+    print("   " + p)
+    for n in notes: print("   -> " + n)
+PY
+)
+
+# =====================================================================================
+# vram: the CPU/GPU memory split
+# The board's 16 GB is shared. Firmware reserves a block for the GPU (the "UMA frame
+# buffer", stock 8 GB) before Linux starts. The setting lives in battery-backed CMOS
+# (second bank, 0x90-0xAB, ports 0x72/0x73), the same block fanoush/bc250_memcfg writes,
+# so stock P3.00/P5.00 firmware works too. Only UMA_SIZE is changed; the write is refused
+# if any memory timing is out of range; a backup is saved first. A CMOS clear undoes it.
+# =====================================================================================
+CMOS_PY=$(cat <<'PY'
+import os, sys
+IDX, DAT, BASE, SIZE = 0x72, 0x73, 0x90, 28
+SIGS = {0x42435041: "LINUX_TOOL", 0x4C424124: "ABL", 0x42534D43: "CMOS_BAD",
+        0x46544457: "WATCHDOG_FIRED", 0x454B4843: "CHECKSUM_ERROR", 0x45474953: "SIGNATURE_ERROR"}
+# name, offset in block, size, min, max (ranges from the firmware's own definition, via bc250_memcfg)
+FIELDS = [("ClockSpeed", 6, 2, 450, 1750), ("tCL", 8, 1, 0x08, 0x21), ("tRAS", 9, 1, 0x15, 0x3A),
+          ("tRCDRD", 10, 1, 0x08, 0x1B), ("tRCDWR", 11, 1, 0x08, 0x1B), ("tRCAb", 12, 1, 0x28, 0x5A),
+          ("tRCPb", 13, 1, 0, 0x0B), ("tRPAb", 14, 1, 0x08, 0x1B), ("tRPPb", 15, 1, 0, 0x0B),
+          ("tRRDS", 16, 1, 0x04, 0x0C), ("tRRDL", 17, 1, 0x04, 0x0C), ("tRTP", 18, 1, 0, 0x0E),
+          ("tFAW", 19, 1, 0x04, 0x22), ("tREF", 20, 2, 0, 0xFFFF), ("RFCPb", 22, 2, 0, 0xFFFF),
+          ("tRFC", 24, 2, 0, 0xFFFF)]
+
+def rd(fd):
+    out = bytearray()
+    for i in range(SIZE):
+        os.pwrite(fd, bytes([BASE + i]), IDX)
+        out += os.pread(fd, 1, DAT)
+    return out
+
+def wr(fd, block):
+    for i, b in enumerate(block):
+        os.pwrite(fd, bytes([BASE + i]), IDX)
+        os.pwrite(fd, bytes([b]), DAT)
+
+def u(b, off, n):
+    return int.from_bytes(b[off:off + n], "little")
+
+def summary(b):
+    sig = u(b, 0, 4)
+    bad = [f"{n}={u(b, o, s)}" for n, o, s, lo, hi in FIELDS if not lo <= u(b, o, s) <= hi]
+    print(f"SIG={SIGS.get(sig, 'UNKNOWN_0x%08X' % sig)}")
+    print(f"CKS_OK={int(u(b, 4, 2) == (sum(b[6:SIZE]) & 0xFFFF))}")
+    print(f"UMA={u(b, 26, 2)}")
+    print(f"RANGES_OK={int(not bad)}")
+    print(f"BAD_FIELDS={' '.join(bad)}")
+    print(f"HEX={b.hex()}")
+    print("TIMINGS=" + " ".join(f"{n}={u(b, o, s)}" for n, o, s, *_ in FIELDS))
+
+mode, port = sys.argv[1], sys.argv[2]
+try:
+    fd = os.open(port, os.O_RDWR)
+except OSError as e:
+    print(f"ERROR={e.strerror}")
+    sys.exit(1)
+
+block = rd(fd)
+if mode == "read":
+    summary(block)
+    sys.exit(0)
+
+# write: argv = write <port> <uma_mb> <backup_file>
+uma, backup = int(sys.argv[3]) & 0xFFF0, sys.argv[4]
+bad = [n for n, o, s, lo, hi in FIELDS if not lo <= u(block, o, s) <= hi]
+if bad:
+    print(f"ERROR=memory timings out of range ({', '.join(bad)}); refusing to write")
+    sys.exit(3)
+with open(backup, "w") as f:
+    f.write(block.hex() + "\n")
+new = bytearray(block)
+new[0:4] = (0x42435041).to_bytes(4, "little")          # LINUX_TOOL signature, as bc250_memcfg writes
+new[26:28] = uma.to_bytes(2, "little")
+new[4:6] = (sum(new[6:SIZE]) & 0xFFFF).to_bytes(2, "little")
+wr(fd, new)
+back = rd(fd)
+if back != new:
+    print(f"ERROR=read-back mismatch (wrote {new.hex()}, read {back.hex()})")
+    sys.exit(4)
+print(f"WROTE_UMA={uma}")
+PY
+)
+
+# vram_diag: prints the diagnosis and sets V_CAUSE (""|cmdline|carveout|other) and the V_* facts
+vram_diag() {
+  local KLOG MEMT CARD VRAMT=0 GTTT=0 FWRAM=0 BIGRES=0 BIGRES_AT="" SRC m s e t CMDLINE CRASHK LOCKDOWN k v
+  KLOG="$(journalctl -k -b 0 -o cat --no-pager 2>/dev/null)"
+  [[ -z $KLOG ]] && KLOG="$(dmesg 2>/dev/null)"
+  V_CAUSE="" V_CMOS_READ=0 V_SIG="" V_CKS=0 V_UMA="" V_RANGES=0 V_BAD="" V_RTC_RESET="" V_CAPARGS=""
+  local HEX="" TIMINGS=""
+
+  section "What Linux sees"
+  MEMT=$(awk '/^MemTotal:/{printf "%.0f", $2*1024}' /proc/meminfo)
+  CARD=$(gpu_card || true)
+  if [[ -n $CARD ]]; then
+    VRAMT=$(cat "$CARD/mem_info_vram_total" 2>/dev/null || echo 0)
+    GTTT=$(cat "$CARD/mem_info_gtt_total" 2>/dev/null || echo 0)
+  fi
+  info "RAM for Linux (MemTotal):         $(gib "$MEMT") GiB"
+  info "GPU reservation (VRAM carve-out): $(gib "$VRAMT") GiB"
+  info "GPU-addressable RAM (GTT):        $(gib "$GTTT") GiB"
+  info "Firmware: $(cat /sys/class/dmi/id/bios_vendor 2>/dev/null) $(cat /sys/class/dmi/id/bios_version 2>/dev/null), dated $(cat /sys/class/dmi/id/bios_date 2>/dev/null)"
+  if [[ -z $CARD ]]; then warn "No AMD GPU under /sys/class/drm: amdgpu isn't loaded, so the GPU reservation can't be read"
+  elif [[ "$(cat "$CARD/device" 2>/dev/null)" != 0x13fe ]]; then warn "This GPU isn't the BC-250's (0x13fe); the verdict below assumes a BC-250"; fi
+  if (( MEMT >= 14*GiB )); then pass "Linux has $(gib "$MEMT") GiB: the split is already right"
+  else fail "Linux has only $(gib "$MEMT") GiB of the board's 16 GB"; fi
+
+  section "What the firmware hands to Linux"
+  _region() {   # start end(inclusive) type
+    local s=$(( $1 )) e=$(( $2 )) sz
+    sz=$(( e - s + 1 ))
+    case $3 in
+      "System RAM"|usable) FWRAM=$(( FWRAM + sz )) ;;
+      *) if (( sz > BIGRES )); then BIGRES=$sz; BIGRES_AT=$(printf '0x%x' "$s"); fi ;;
+    esac
+  }
+  if [[ -d /sys/firmware/memmap ]] && compgen -G "/sys/firmware/memmap/*" >/dev/null; then
+    for m in /sys/firmware/memmap/*; do _region "$(cat "$m/start")" "$(cat "$m/end")" "$(cat "$m/type")"; done
+    SRC="/sys/firmware/memmap"
+  else
+    while read -r s e t; do _region "0x$s" "0x$e" "$t"; done < <(
+      grep -oE 'BIOS-e820: \[mem 0x[0-9a-f]+-0x[0-9a-f]+\] [a-zA-Z ]+' <<<"$KLOG" |
+      sed -E 's/.*0x([0-9a-f]+)-0x([0-9a-f]+)\] (.*)/\1 \2 \3/')
+    SRC="the kernel log's e820 map"
+  fi
+  if (( FWRAM > 0 )); then
+    info "Usable RAM in the firmware's map ($SRC): $(gib "$FWRAM") GiB"
+    info "Largest block the firmware keeps back:   $(gib "$BIGRES") GiB at $BIGRES_AT"
+  else warn "Couldn't read the firmware memory map"; fi
+  CMDLINE="$(cat /proc/cmdline)"
+  V_CAPARGS="$(grep -oE '(^| )(mem|memmap|max_addr)=[^ ]+' <<<"$CMDLINE" | tr -d ' ' | tr '\n' ' ')"
+  CRASHK="$(grep -oE '(^| )crashkernel=[^ ]+' <<<"$CMDLINE" | tr -d ' ')"
+  if [[ -n $V_CAPARGS ]]; then fail "Kernel boot options limit memory: $V_CAPARGS"
+  else pass "No kernel boot option limits memory (mem=, memmap=, max_addr=)"; fi
+  [[ -n $CRASHK ]] && info "Also set: $CRASHK (reserves a little memory for crash dumps; normally a few hundred MB)"
+
+  section "Memory settings stored in CMOS"
+  LOCKDOWN="$(cat /sys/kernel/security/lockdown 2>/dev/null || echo '[none]')"
+  if ! grep -q '\[none\]' <<<"$LOCKDOWN"; then
+    fail "Kernel lockdown is on ($LOCKDOWN), usually because Secure Boot is enabled. It blocks direct CMOS access, so this can't be checked or fixed from Linux. Turn Secure Boot off in the BIOS, or use the BIOS menu route below."
+  elif [[ ! -e $CMOS_PORT ]]; then
+    fail "$CMOS_PORT doesn't exist on this kernel, so CMOS can't be read from Linux. Use the BIOS menu route below."
+  elif [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    warn "Reading CMOS needs root; run with sudo"
+  else
+    while IFS='=' read -r k v; do
+      case $k in
+        SIG) V_SIG=$v; V_CMOS_READ=1 ;; CKS_OK) V_CKS=$v ;; UMA) V_UMA=$v ;;
+        RANGES_OK) V_RANGES=$v ;; BAD_FIELDS) V_BAD=$v ;; HEX) HEX=$v ;;
+        TIMINGS) TIMINGS=$v ;; ERROR) fail "Couldn't read CMOS: $v" ;;
+      esac
+    done < <(python3 -c "$CMOS_PY" read "$CMOS_PORT" 2>&1)
+  fi
+  if (( V_CMOS_READ )); then
+    info "Block signature: $V_SIG   checksum: $([[ $V_CKS == 1 ]] && echo valid || echo INVALID)"
+    info "UMA_SIZE (GPU reservation) stored: ${V_UMA} MB"
+    info "Timings: $TIMINGS"
+    info "Raw block 0x90-0xAB: $HEX"
+    case $V_SIG in
+      LINUX_TOOL) info "'LINUX_TOOL' means bc250_memcfg (or this tool) wrote the block and the board hasn't rebooted since." ;;
+      ABL)        info "'ABL' means the firmware accepted the stored settings at power-on and re-stamped the block." ;;
+      CMOS_BAD|WATCHDOG_FIRED|CHECKSUM_ERROR|SIGNATURE_ERROR)
+                  fail "Status $V_SIG: the firmware isn't using custom memory settings from CMOS, so it boots with its defaults (an 8 GB reservation)." ;;
+      *)          warn "Unrecognised signature: CMOS may have been cleared or never written by this firmware." ;;
+    esac
+    [[ $V_RANGES == 1 ]] || warn "Memory timings outside the firmware's valid ranges: $V_BAD"
+  fi
+
+  section "Does the setting survive power loss?"
+  local RTCL BTIME RTC_EPOCH RTC_DATE DIFF PREV="" CHANGES=0 LASTCHG="" off L mem when
+  local -A SEEN=()
+  local -a BOOTS
+  RTCL="$(grep -m1 -E 'rtc_cmos.*setting system clock to' <<<"$KLOG")"
+  BTIME=$(awk '/^btime/{print $2}' /proc/stat)
+  if [[ -n $RTCL ]]; then
+    RTC_EPOCH=$(grep -oE '\(([0-9]+)\)' <<<"$RTCL" | tr -d '()'); RTC_EPOCH=${RTC_EPOCH:-$BTIME}
+    RTC_DATE=$(grep -oE 'to [0-9T:-]+' <<<"$RTCL" | cut -c4-)
+    DIFF=$(( RTC_EPOCH > BTIME ? RTC_EPOCH - BTIME : BTIME - RTC_EPOCH ))
+    info "Board clock at power-on: $RTC_DATE UTC; real boot time: $(date -u -d "@$BTIME" '+%Y-%m-%dT%H:%M:%S') UTC"
+    if (( DIFF > 86400 )); then
+      V_RTC_RESET=1
+      fail "The board's clock was off by $(( DIFF / 86400 )) days at power-on. CMOS lost power, which also erases the memory split. Replace the CR2032 coin cell."
+    else V_RTC_RESET=0; pass "Board clock was right at power-on, so CMOS kept its power"; fi
+  else info "No RTC line in this boot's kernel log; can't tell whether CMOS lost power"; fi
+  mapfile -t BOOTS < <(journalctl --list-boots --no-pager 2>/dev/null | awk '$1 ~ /^-?[0-9]+$/ {print $1}' | tail -n 10)
+  if (( ${#BOOTS[@]} > 1 )); then
+    info "GPU reservation by boot (newest last):"
+    for off in "${BOOTS[@]}"; do
+      L="$(journalctl -k -b "$off" -o cat --no-pager 2>/dev/null)"
+      v=$(grep -m1 -oE 'VRAM: [0-9]+M' <<<"$L" | grep -oE '[0-9]+')
+      mem=$(grep -m1 -oE 'Memory: [0-9]+K/[0-9]+K' <<<"$L" | sed -E 's#Memory: [0-9]+K/([0-9]+)K#\1#')
+      when=$(journalctl -b "$off" -n 1 -o short-iso --no-pager -q 2>/dev/null | tail -n1 | cut -d' ' -f1)
+      info "  boot $off (${when:-?}): GPU ${v:-?} MB, RAM $( [[ -n $mem ]] && gib $(( mem * 1024 )) || echo '?') GiB"
+      if [[ -n $v ]]; then
+        SEEN[$v]=1
+        if [[ -n $PREV && $v != "$PREV" ]]; then CHANGES=$((CHANGES+1)); LASTCHG=$off; fi
+        PREV=$v
+      fi
+    done
+    if (( CHANGES == 1 )); then info "The reservation changed once, at boot $LASTCHG, and has held since: a new setting taking effect, not one being lost."
+    elif (( CHANGES > 1 )); then warn "The reservation changed $CHANGES time(s) between boots (${!SEEN[*]} MB): the setting is applied, then lost. Usual causes are a weak CMOS battery or a CMOS clear."
+    elif (( ${#SEEN[@]} == 1 )); then info "Same reservation on every logged boot: the setting never took effect, rather than being lost."; fi
+  else info "Only one boot in the journal; boot history needs a persistent journal (sudo bc250-fixer fix journal)"; fi
+  grep -q 'Failed to pin framebuffer with error -12' <<<"$KLOG" &&
+    warn "'Failed to pin framebuffer' in the log: the display ran out of GPU memory. With a monitor attached, 512 MB can be too small; headless use is fine."
+
+  section "Verdict"
+  local HELD
+  if (( MEMT >= 14*GiB )); then
+    pass "Nothing to fix: Linux has $(gib "$MEMT") GiB and the GPU reserves $(gib "$VRAMT") GiB."
+    info "If models still fail to load, check ttm.pages_limit (bc250-fixer check); it caps how much of that RAM the GPU can use."
+  elif (( FWRAM > 0 && FWRAM - MEMT > GiB )); then
+    V_CAUSE=cmdline
+    fail "The firmware hands Linux $(gib "$FWRAM") GiB, but a kernel boot option keeps it to $(gib "$MEMT") GiB: $V_CAPARGS"
+  elif (( VRAMT >= 3*GiB || BIGRES >= 3*GiB || (FWRAM > 0 && FWRAM < 12*GiB) )); then
+    # On this 16 GB board, firmware handing Linux under 12 GiB can only mean the GPU reservation.
+    V_CAUSE=carveout
+    HELD=$(( VRAMT > BIGRES ? VRAMT : BIGRES ))
+    (( HELD < 3*GiB && FWRAM > 0 )) && HELD=$(( 16*GiB - FWRAM ))
+    fail "The firmware still holds back about $(gib "$HELD") GiB for the GPU."
+    if (( V_CMOS_READ )); then
+      if [[ $V_SIG == LINUX_TOOL ]] && (( V_UMA >= 2048 )); then
+        info "Likely cause: CMOS holds UMA_SIZE=${V_UMA} MB written by bc250_memcfg; that block probably takes priority over the BIOS menu."
+      elif (( V_UMA > 0 && V_UMA < 2048 )) && [[ $V_CKS == 1 && $V_SIG == LINUX_TOOL ]]; then
+        info "CMOS already asks for ${V_UMA} MB with a valid checksum. If that was set since this boot, a reboot applies it."
+      elif [[ $V_SIG =~ ERROR|BAD|WATCHDOG ]]; then
+        info "Likely cause: no custom settings are active in CMOS (status $V_SIG), so the firmware uses its defaults. 'bc250-fixer vram fix' writes a valid block."
+      else info "CMOS stores UMA_SIZE=${V_UMA} MB (signature $V_SIG)."; fi
+    fi
+    [[ $V_RTC_RESET == 1 ]] && info "CMOS is also losing power, so any fix will be lost at the next power cut until the battery is replaced."
+    printf '\n  BIOS menu route (works on any firmware that shows the menu):\n'
+    printf '    Chipset > GFX Configuration > GFX Configuration:\n'
+    printf '      Integrated Graphics Controller = Forced\n'
+    printf '      UMA Mode = UMA_SPECIFIED          (with any other mode, the size below is ignored)\n'
+    printf '      UMA Frame Buffer Size = 512M\n'
+    printf '    Save with F10. If settings never stick after a BIOS flash, clear CMOS properly: battery out\n'
+    printf '    for 60 s, press the power button 5 times with it out, then set everything again.\n'
+  else
+    V_CAUSE=other
+    warn "Unusual: neither the GPU reservation nor a boot option explains the missing memory. Firmware map: $(gib "$FWRAM") GiB usable, largest reserved block $(gib "$BIGRES") GiB."
+  fi
+}
+
+# vram_fix [MB]: act on vram_diag's verdict. Returns 0 if a change was made (reboot needed).
+vram_check_mb() {   # the firmware stores the size in 16 MB steps, so check the rounded value
+  [[ $1 =~ ^[0-9]+$ ]] || die "the GPU reservation must be a number of MB (got '$1')"
+  local mb=$(( $1 / 16 * 16 ))
+  (( mb >= 256 && mb <= 12288 )) || die "the GPU reservation must be 256-12288 MB (got '$1')"
+  (( mb != 2048 )) || die "$1 MB rounds to 2048 MB, a known bad value on this board (Linux won't boot). Use 512, 1024 or 4096+."
+  (( mb == $1 )) || warn "$1 MB isn't a multiple of 16; using $mb MB"
+}
+vram_fix() {
+  local mb="${1:-512}" res backup
+  vram_check_mb "$mb"; mb=$(( mb / 16 * 16 ))
+  section "Fix: memory split"
+  case $V_CAUSE in
+    cmdline)
+      ask "Remove ${V_CAPARGS}from the kernel boot options?" || return 1
+      local a; for a in $V_CAPARGS; do karg_remove "${a%%=*}"; done
+      return 0 ;;
+    carveout)
+      if (( ! V_CMOS_READ )); then
+        warn "CMOS can't be written from Linux here (see above). Use the BIOS menu route."
+        return 1
+      fi
+      if [[ $V_RANGES != 1 ]]; then
+        fail "Not writing: the stored memory timings are out of range ($V_BAD). Writing them back with a valid checksum could stop the board booting. Clear CMOS, then use the BIOS menu or run this again."
+        return 1
+      fi
+      [[ $V_RTC_RESET == 1 ]] && warn "Replace the CMOS battery too, or this will be lost the next time the board loses power."
+      ask "Set the GPU reservation in CMOS to ${mb} MB (keeps every memory timing as it is)?" || return 1
+      if (( DRY )); then printf '  %s[dry-run]%s would write UMA_SIZE=%s into CMOS 0x90-0xAB (signature LINUX_TOOL, new checksum)\n' "$Y" "$N" "$mb"; return 0; fi
+      mkdir -p "$STATE"
+      backup="$STATE/cmos-backup-$(date +%Y%m%d-%H%M%S).hex"
+      res="$(python3 -c "$CMOS_PY" write "$CMOS_PORT" "$mb" "$backup" 2>&1)"
+      if grep -q '^WROTE_UMA=' <<<"$res"; then
+        ok "CMOS now asks for ${res#WROTE_UMA=} MB (read back and verified). Old block saved to $backup"
+        info "After a reboot expect about $(awk -v m="$mb" 'BEGIN{printf "%.1f", 15.3 - m/1024}') GiB in 'free -h'. To undo: clear CMOS (jumper, or battery out for 60 s)."
+        info "Reboot normally; don't unplug first."
+        return 0
+      fi
+      fail "Write failed: ${res#ERROR=}"; return 1 ;;
+    "") return 1 ;;
+    *) info "Nothing this tool can fix automatically."; return 1 ;;
+  esac
+}
+
+cmd_vram() {
+  local sub="${1:-check}"
+  need_root vram
+  case $sub in
+    check) printf '%sBC-250 memory split check%s, %s\n' "$B" "$N" "$(date)"; vram_diag
+           [[ $V_CAUSE == cmdline || $V_CAUSE == carveout ]] && printf '\n  To fix it from here: sudo bc250-fixer vram fix   (--dry-run to preview)\n' ;;
+    fix)   vram_check_mb "${2:-512}"; vram_diag
+           if vram_fix "${2:-512}"; then
+             if [[ $V_CAUSE == cmdline ]]; then karg_commit || return 1; fi
+             printf '\n  Reboot to apply%s.\n' "$( (( DRY )) && echo ' (nothing was changed: dry run)')"
+           fi ;;
+    *) die "usage: bc250-fixer vram [check|fix [MB]]" ;;
+  esac
+}
+
+# =====================================================================================
+# kernel boot options: queued, then applied once through whatever this system uses
+# =====================================================================================
+KARG_SET=() KARG_DEL=()
+karg_set()    { KARG_SET+=("$1=$2"); }
+karg_remove() { KARG_DEL+=("$1"); }
+karg_backend() {
+  if [[ -e /run/ostree-booted ]] && have rpm-ostree; then echo rpm-ostree
+  elif have grubby; then echo grubby
+  elif have kernelstub; then echo kernelstub
+  elif [[ -f /etc/kernel/cmdline ]]; then echo kernel-cmdline
+  elif [[ -f /etc/default/grub ]]; then echo grub
+  else echo none; fi
+}
+KARG_PY=$(cat <<'PY'
+import re, sys
+kind, path, ops = sys.argv[1], sys.argv[2], sys.argv[3:]
+try:
+    text = open(path, encoding="utf-8").read()
+except Exception as e:
+    sys.exit(f"can't read {path}: {e}")
+sets = [o[4:] for o in ops if o.startswith("set:")]
+dels = [o[4:] for o in ops if o.startswith("del:")]
+keys = {a.split("=", 1)[0] for a in sets} | set(dels)
+def edit(val, add):
+    toks = [t for t in val.split() if t.split("=", 1)[0] not in keys]
+    return " ".join(toks + (sets if add else []))
+if kind == "kernel-cmdline":
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) != 1:
+        sys.exit(f"{path} should hold one line of options; found {len(lines)}. Edit it by hand.")
+    sys.stdout.write(edit(lines[0], True) + "\n")
+    sys.exit(0)
+LINE = re.compile(r"^(GRUB_CMDLINE_LINUX(?:_DEFAULT)?)=(.*)$")
+def parse(rhs):   # (quote, value, tail) or None if it isn't a simple one-line assignment
+    if rhs[:1] in ('"', "'"):
+        q, i, buf = rhs[0], 1, []
+        while i < len(rhs):
+            c = rhs[i]
+            if q == '"' and c == "\\" and i + 1 < len(rhs):
+                buf.append(rhs[i:i + 2]); i += 2; continue
+            if c == q:
+                break
+            buf.append(c); i += 1
+        else:
+            return None
+        tail = rhs[i + 1:]
+    else:
+        m = re.match(r"([^\s#\"']*)(.*)$", rhs)
+        q, buf, tail = "", [m.group(1)], m.group(2)
+    if tail.strip() and not tail.strip().startswith("#"):
+        return None
+    return q, "".join(buf), tail
+lines = text.split("\n")
+found = []
+for i, l in enumerate(lines):
+    m = LINE.match(l)
+    if not m:
+        continue
+    p = parse(m.group(2))
+    if p is None:
+        sys.exit(f"can't safely parse line {i + 1} of {path}: {l!r}. Edit it by hand.")
+    found.append((i, m.group(1)) + p)
+pref = "GRUB_CMDLINE_LINUX_DEFAULT" if any(f[1] == "GRUB_CMDLINE_LINUX_DEFAULT" for f in found) else "GRUB_CMDLINE_LINUX"
+target = max([f[0] for f in found if f[1] == pref], default=None)   # GRUB uses the last assignment
+for i, var, q, val, tail in found:   # removals on every line; additions on the one GRUB uses
+    qq = q or '"'
+    lines[i] = f"{var}={qq}{edit(val, i == target)}{qq}{tail}"
+out = "\n".join(lines)
+if target is None and sets:
+    out = out + ("" if out.endswith("\n") else "\n") + f'{pref}="{" ".join(sets)}"\n'
+sys.stdout.write(out)
+PY
+)
+karg_commit() {   # returns 0 if something was changed (reboot needed)
+  (( ${#KARG_SET[@]} + ${#KARG_DEL[@]} > 0 )) || return 1
+  local be k t a cur ops=() args=() rm=()
+  be=$(karg_backend)
+  section "Kernel boot options ($be)"
+  for a in "${KARG_SET[@]}"; do info "set    $a"; done
+  for k in "${KARG_DEL[@]}"; do info "remove $k"; done
+  case $be in
+    rpm-ostree)
+      for a in "${KARG_SET[@]}"; do
+        k=${a%%=*}; cur=$(tr ' ' '\n' </proc/cmdline | grep -m1 "^$k=")
+        if [[ -n $cur ]]; then args+=("--replace=$k=${a#*=}"); else args+=("--append-if-missing=$a"); fi
+      done
+      for k in "${KARG_DEL[@]}"; do
+        while read -r t; do [[ -n $t ]] && args+=("--delete-if-present=$t"); done < <(tr ' ' '\n' </proc/cmdline | grep -E "^$k(=|$)")
+      done
+      (( ${#args[@]} )) && { act rpm-ostree kargs "${args[@]}" || { fail "rpm-ostree kargs failed"; return 1; }; } ;;
+    grubby)
+      (( ${#KARG_SET[@]} )) && args=(--args="${KARG_SET[*]}")
+      (( ${#KARG_DEL[@]} )) && rm=(--remove-args="${KARG_DEL[*]}")
+      act grubby --update-kernel=ALL "${args[@]}" "${rm[@]}" || { fail "grubby failed"; return 1; } ;;
+    kernelstub)
+      for k in "${KARG_DEL[@]}"; do
+        while read -r t; do
+          [[ -n $t ]] || continue
+          act kernelstub -d "$t" || { fail "kernelstub -d $t failed"; return 1; }
+        done < <(tr ' ' '\n' </proc/cmdline | grep -E "^$k(=|$)")
+      done
+      for a in "${KARG_SET[@]}"; do act kernelstub -a "$a" || { fail "kernelstub -a $a failed"; return 1; }; done ;;
+    kernel-cmdline|grub)
+      local f=/etc/default/grub tmp err seen
+      [[ $be == kernel-cmdline ]] && f=/etc/kernel/cmdline
+      have python3 || { fail "python3 is needed to edit $f safely; nothing was changed"; return 1; }
+      for a in "${KARG_SET[@]}"; do ops+=("set:$a"); done
+      for k in "${KARG_DEL[@]}"; do ops+=("del:$k"); done
+      tmp=$(mktemp)
+      if ! err=$(python3 -c "$KARG_PY" "$be" "$f" "${ops[@]}" 2>&1 >"$tmp") || [[ ! -s $tmp ]]; then
+        rm -f "$tmp"; err=${err%.}; fail "couldn't edit $f: ${err:-empty result}. Nothing was changed."; return 1
+      fi
+      if [[ $be == grub ]]; then
+        # check the result the way grub-mkconfig reads it: it sources this file
+        bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; fail "the edited $f wouldn't parse; nothing was changed"; return 1; }
+        seen=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s %s" "${GRUB_CMDLINE_LINUX:-}" "${GRUB_CMDLINE_LINUX_DEFAULT:-}"' _ "$tmp")
+        for a in "${KARG_SET[@]}"; do [[ " $seen " == *" $a "* ]] || { rm -f "$tmp"; fail "check of the edited $f failed ($a missing); nothing was changed"; return 1; }; done
+        for k in "${KARG_DEL[@]}"; do [[ " $seen " != *" $k="* && " $seen " != *" $k "* ]] || { rm -f "$tmp"; fail "check of the edited $f failed ($k still there); nothing was changed"; return 1; }; done
+        local d; d=$(grep -lsE '^[[:space:]]*GRUB_CMDLINE_LINUX' /etc/default/grub.d/*.cfg 2>/dev/null | tr '\n' ' ')
+        [[ -n $d ]] && warn "these files also set kernel options and are read after $f, so they may override it: $d"
+      fi
+      write_file "$f" <"$tmp" || { rm -f "$tmp"; fail "couldn't write $f"; return 1; }
+      rm -f "$tmp"
+      if [[ $be == grub ]]; then
+        local regen=()
+        if have update-grub; then regen=(update-grub)
+        elif have grub-mkconfig && [[ -f /boot/grub/grub.cfg ]]; then regen=(grub-mkconfig -o /boot/grub/grub.cfg)
+        elif have grub2-mkconfig && [[ -f /boot/grub2/grub.cfg ]]; then regen=(grub2-mkconfig -o /boot/grub2/grub.cfg); fi
+        if (( ${#regen[@]} )); then
+          act "${regen[@]}" || { fail "${regen[*]} failed. $f was edited (backup: $f.bc250-fixer.bak); fix the error before rebooting"; return 1; }
+        else warn "edited $f, but couldn't find how to regenerate the GRUB config; do it before rebooting"; fi
+      else
+        warn "edited /etc/kernel/cmdline; regenerate your boot entries before rebooting (e.g. 'mkinitcpio -P' for UKIs, or 'kernel-install add \$(uname -r) /lib/modules/\$(uname -r)/vmlinuz')"
+      fi ;;
+    *) warn "couldn't tell how this system sets boot options; add/remove them by hand: ${KARG_SET[*]} / remove ${KARG_DEL[*]}"; return 1 ;;
+  esac
+  KARG_SET=() KARG_DEL=()
+  did "boot options updated (takes effect at the next boot)"
+}
+
+# =====================================================================================
+# fix: guided fixes for what check finds
+# =====================================================================================
+REBOOT_NEEDED=0
+
+fix_journal() {
+  section "Persistent journal (so crash logs survive a reboot)"
+  local vol
+  vol=$(grep -hsE '^\s*Storage\s*=\s*(volatile|none)' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null | tail -n1)
+  if [[ -n "$(ls -A /var/log/journal 2>/dev/null)" && -z $vol ]]; then pass "the journal is already persistent"; return; fi
+  [[ -n $vol ]] && info "journald is configured with '$vol'"
+  ask "Make the journal persistent?" || return
+  act mkdir -p /var/log/journal
+  printf '[Journal]\nStorage=persistent\n' | write_file /etc/systemd/journald.conf.d/50-bc250-fixer.conf
+  act systemd-tmpfiles --create --prefix /var/log/journal
+  act systemctl restart systemd-journald
+  did "journal is persistent from now on (no reboot needed)"
+}
+
+fix_pages_limit() {
+  section "GPU memory limit (ttm.pages_limit = $GOOD_PAGES_LIMIT, the same everywhere)"
+  local live cmd f line val conflicts=0 base
+  live=$(cat /sys/module/ttm/parameters/pages_limit 2>/dev/null || echo 0)
+  cmd=$(tr ' ' '\n' </proc/cmdline | grep -m1 '^ttm.pages_limit=' | cut -d= -f2)
+  local -a mod_files=() tmp_files=() usr_tmp=()
+  while IFS=: read -r f line; do
+    val=$(grep -oE 'pages_limit=[0-9]+' <<<"$line" | cut -d= -f2)
+    [[ -n $val && $val != "$GOOD_PAGES_LIMIT" ]] && { mod_files+=("$f"); conflicts=1; }
+  done < <(grep -rsH --include='*.conf' 'pages_limit' /etc/modprobe.d 2>/dev/null)
+  while IFS=: read -r f line; do
+    val=$(awk '{print $NF}' <<<"$line")
+    [[ $val =~ ^[0-9]+$ && $val != "$GOOD_PAGES_LIMIT" ]] || continue
+    [[ $f == /usr/lib/* && -e /etc/tmpfiles.d/$(basename "$f") ]] && continue   # already overridden
+    conflicts=1
+    if [[ $f == /etc/* ]]; then tmp_files+=("$f"); else usr_tmp+=("$f"); fi
+  done < <(grep -rsH --include='*.conf' 'ttm/parameters/pages_limit' /etc/tmpfiles.d /usr/lib/tmpfiles.d 2>/dev/null)
+  local gtt=0; tr ' ' '\n' </proc/cmdline | grep -q '^amdgpu.gttsize' && gtt=1
+  info "live value $live; boot option ${cmd:-not set}"
+  if (( live >= 3959290 && conflicts == 0 && gtt == 0 )); then pass "pages_limit is $live, with no conflicting settings"; return; fi
+  local extra=""; (( gtt )) && extra=" and remove the deprecated amdgpu.gttsize"
+  ask "Set ttm.pages_limit=$GOOD_PAGES_LIMIT everywhere it appears$extra?" || return
+  [[ $cmd == "$GOOD_PAGES_LIMIT" ]] || karg_set ttm.pages_limit "$GOOD_PAGES_LIMIT"
+  (( gtt )) && karg_remove amdgpu.gttsize
+  for f in "${mod_files[@]}"; do
+    backup "$f"; act sed -i -E "s/pages_limit=[0-9]+/pages_limit=$GOOD_PAGES_LIMIT/g" "$f"; info "fixed $f"
+  done
+  for f in "${tmp_files[@]}"; do
+    backup "$f"; act sed -i -E "/ttm\/parameters\/pages_limit/ s/[0-9]+[[:space:]]*\$/$GOOD_PAGES_LIMIT/" "$f"; info "fixed $f"
+  done
+  for f in "${usr_tmp[@]}"; do   # package-owned: override with a same-named file in /etc
+    base=$(basename "$f")
+    sed -E "/ttm\/parameters\/pages_limit/ s/[0-9]+[[:space:]]*\$/$GOOD_PAGES_LIMIT/" "$f" | write_file "/etc/tmpfiles.d/$base"
+    info "overrode $f with /etc/tmpfiles.d/$base"
+  done
+  REBOOT_NEEDED=1
+}
+
+fix_iommu() {
+  section "IOMMU (a known source of instability on this board)"
+  if grep -qE '(amd_iommu|iommu)=off' /proc/cmdline || [[ -z "$(ls -A /sys/class/iommu 2>/dev/null)" ]]; then pass "IOMMU is off"; return; fi
+  info "Turning it off in the BIOS is best. A kernel option does the same job if the menu doesn't offer it."
+  ask "Add the kernel option amd_iommu=off?" || return
+  karg_set amd_iommu off
+  REBOOT_NEEDED=1
+}
+
+fix_vram() {
+  local memt; memt=$(awk '/^MemTotal:/{printf "%.0f", $2*1024}' /proc/meminfo)
+  if (( memt >= 14*GiB )); then section "Memory split"; pass "Linux has $(gib "$memt") GiB: the split is already right"; return; fi
+  vram_diag
+  vram_fix "${VRAM_MB:-512}" && REBOOT_NEEDED=1
+}
+
+fix_swap() {
+  section "Disk swap (a safety net for memory peaks; ${SWAP_GB} GiB swapfile)"
+  local disk file=/var/swap/swapfile fs avail need
+  disk=$(awk 'NR>1 && $1 !~ /zram/ {s+=$3} END{print s*1024+0}' /proc/swaps)
+  if (( disk >= 8000000000 )); then pass "disk swap: $(gib "$disk") GiB"; return; fi
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$file"; then pass "$file is already active"; return; fi
+  fs=$(stat -f -c %T /var/swap 2>/dev/null || stat -f -c %T /var)
+  avail=$(df -B1 --output=avail /var 2>/dev/null | tail -n1 | tr -d ' ')
+  need=$(( (SWAP_GB + 2) * GiB ))
+  (( avail >= need )) || { warn "only $(gib "$avail") GiB free on /var; a ${SWAP_GB} GiB swapfile needs $(gib "$need"). Use --size N for a smaller one."; return; }
+  ask "Create a ${SWAP_GB} GiB swapfile at $file (filesystem: $fs) and enable it at boot?" || return
+  act mkdir -p /var/swap
+  if [[ -e $file ]]; then
+    [[ "$(blkid -p -s TYPE -o value "$file" 2>/dev/null)" == swap ]] ||
+      { fail "$file already exists and isn't a swapfile; move it away first"; return; }
+    info "$file exists already and is a swapfile; reusing it"
+  elif [[ $fs == btrfs ]] && btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+    act btrfs filesystem mkswapfile --size "${SWAP_GB}g" "$file" || { fail "couldn't create the swapfile"; return; }
+  else
+    act truncate -s 0 "$file"
+    [[ $fs == btrfs ]] && act chattr +C "$file"
+    if ! act fallocate -l "${SWAP_GB}G" "$file"; then act dd if=/dev/zero of="$file" bs=1M count=$(( SWAP_GB * 1024 )) status=none; fi
+    act chmod 600 "$file"
+    act mkswap "$file" || { fail "mkswap failed"; return; }
+  fi
+  if have selinuxenabled && selinuxenabled; then
+    if have semanage; then act semanage fcontext -a -t swapfile_t '/var/swap(/.*)?' 2>/dev/null; act restorecon -RF /var/swap
+    else act chcon -t swapfile_t "$file"; fi
+  fi
+  if ! grep -qE "^[[:space:]]*${file}[[:space:]]" /etc/fstab; then
+    backup /etc/fstab
+    if (( DRY )); then printf '  %s[dry-run]%s would add to /etc/fstab: %s none swap defaults,pri=10 0 0\n' "$Y" "$N" "$file"
+    else
+      [[ -s /etc/fstab && -n "$(tail -c1 /etc/fstab)" ]] && echo >>/etc/fstab   # don't glue onto a last line without a newline
+      printf '%s none swap defaults,pri=10 0 0\n' "$file" >>/etc/fstab
+    fi
+  fi
+  if act swapon -p 10 "$file"; then did "swapfile active and in /etc/fstab"
+  else fail "swapon $file failed; it's in /etc/fstab but not active. Check: dmesg | tail"; fi
+}
+
+fix_zram() {
+  section "zram (compressed swap in RAM: keep it near 2 GiB, it competes with the model)"
+  local z total=0
+  for z in /sys/block/zram*/disksize; do [[ -r $z ]] && total=$(( total + $(cat "$z") )); done
+  if (( total <= 4 * GiB )); then pass "zram is $(gib "$total") GiB"; return; fi
+  if [[ -x /usr/lib/systemd/system-generators/zram-generator ]] || [[ -e /usr/lib/systemd/zram-generator.conf ]]; then
+    ask "Limit zram to 2 GiB (takes effect at the next boot)?" || return
+    printf '[zram0]\nzram-size = min(ram / 4, 2048)\ncompression-algorithm = zstd\n' | write_file /etc/systemd/zram-generator.conf
+    REBOOT_NEEDED=1
+  else
+    warn "zram is $(gib "$total") GiB, but it isn't set up by systemd's zram-generator here. Set it to ~2 GiB in your distro's zram config (e.g. /etc/default/zramswap)."
+  fi
+}
+
+cmd_fix() {
+  need_root fix
+  local -a items=("$@") all=(journal pages-limit iommu vram swap zram)
+  local i
+  (( ${#items[@]} )) || items=("${all[@]}")
+  for i in "${items[@]}"; do   # check every name before changing anything
+    case $i in journal|pages-limit|pages_limit|ttm|iommu|vram|split|swap|zram) ;; *) die "unknown fix '$i' (choose from: ${all[*]})" ;; esac
+  done
+  printf '%sBC-250 guided fixes%s%s\n' "$B" "$N" "$( (( DRY )) && echo ' (dry run: nothing will be changed)')"
+  is_bc250 || warn "this doesn't look like a BC-250 (no PCI device 1002:13fe); continuing because the fixes are generic"
+  for i in "${items[@]}"; do
+    case $i in
+      journal) fix_journal ;; pages-limit|pages_limit|ttm) fix_pages_limit ;; iommu) fix_iommu ;;
+      vram|split) fix_vram ;; swap) fix_swap ;; zram) fix_zram ;;
+      *) die "unknown fix '$i' (choose from: ${all[*]})" ;;
+    esac
+  done
+  local kfail=0
+  if karg_commit; then REBOOT_NEEDED=1; elif (( ${#KARG_SET[@]} + ${#KARG_DEL[@]} )); then kfail=1; fi
+  section "Done"
+  if (( kfail )); then
+    fail "the kernel boot options weren't applied (see above). Sort that out before rebooting, then run: sudo bc250-fixer fix"
+  elif (( REBOOT_NEEDED )); then
+    if (( DRY )); then info "dry run: some of these would need a reboot"
+    else printf '  Reboot to apply: sudo systemctl reboot   Then check again: sudo bc250-fixer check\n'; fi
+  else info "nothing needs a reboot"; fi
+}
+
+cmd_headless() {
+  case "${1:-status}" in
+    status) info "default boot target: $(systemctl get-default 2>/dev/null)" ;;
+    on)  need_root headless; act systemctl set-default multi-user.target && did "boots to a text console from the next boot (frees ~0.6-1 GB). Undo: sudo bc250-fixer headless off" ;;
+    off) need_root headless; act systemctl set-default graphical.target && did "boots to the desktop again from the next boot" ;;
+    *) die "usage: bc250-fixer headless on|off|status" ;;
+  esac
+}
+
+# =====================================================================================
+# cu: GPU compute units. The GPU has 40 CUs in 20 pairs (WGPs); the factory enables 12
+# WGPs (24 CUs). Builds on two community tools, fetched at pinned commits:
+#   WinnieLV/bc250-cu-live-manager  writes the WGP routing registers live through umr:
+#                                   no kernel patch, no reboot, survives kernel updates
+#   duggasco/bc250-40cu-unlock      bc250-compute-verify.sh: every GPU result is checked
+#                                   against the same maths done on the CPU
+# A WGP is written SE.SH.WGP, e.g. 1.0.4 = shader engine 1, array 0, WGP 4 (CUs 8-9).
+# =====================================================================================
+CU_STATE="$STATE/cu"
+RESULTS="$CU_STATE/results.tsv"
+INPROG="$CU_STATE/in-progress"
+RUN="$CU_STATE/run"
+LM_UNIT="bc250-cu-live-manager.service"
+GUARD_UNIT="bc250-fixer-guard.service"
+LOG=/dev/null
+start_log() { (( DRY )) && { LOG=/dev/null; return; }; mkdir -p "$STATE/logs" "$CU_STATE" "$RUN"; LOG="$STATE/logs/$1-$(date +%Y%m%d-%H%M%S).log"; : >"$LOG"; }
+
+lm() {   # the live manager, non-interactive, output to the log (shown, not run, under --dry-run)
+  if (( DRY )); then printf '  %s[dry-run]%s live-manager %s\n' "$Y" "$N" "$*"; return 0; fi
+  "$LM" --yes "$@" >>"$LOG" 2>&1
+}
+
+# ---------- routing ----------
+# CUR[0..3]: routed WGPs; DRV[0..3]: the driver's factory WGPs. One 5-bit mask per shader
+# array, in SE0.SH0, SE0.SH1, SE1.SH0, SE1.SH1 order.
+CUR=(0 0 0 0); DRV=(0 0 0 0)
+read_routing() {
+  local out line se sh row i c got=0
+  local -a cells
+  out="$("$LM" status 2>&1 | strip_color)"
+  CUR=(0 0 0 0); DRV=(0 0 0 0)
+  while IFS= read -r line; do
+    [[ $line =~ \|\ SE([01])\.SH([01])\ \| ]] || continue
+    se=${BASH_REMATCH[1]} sh=${BASH_REMATCH[2]} row=$(( se * 2 + sh ))
+    IFS='|' read -r -a cells <<<"$line"
+    for i in 0 1 2 3 4; do
+      c="${cells[$(( i + 2 ))]:-}"; c="${c// /}"
+      case $c in
+        D+) CUR[row]=$(( CUR[row] | 1 << i )); DRV[row]=$(( DRV[row] | 1 << i )) ;;
+        D!) DRV[row]=$(( DRV[row] | 1 << i )) ;;
+        S+) CUR[row]=$(( CUR[row] | 1 << i )) ;;
+      esac
+    done
+    got=$(( got + 1 ))
+  done <<<"$out"
+  (( got == 4 )) || { printf '%s\n' "$out" >>"$LOG"; return 1; }
+  (( DRV[0] + DRV[1] + DRV[2] + DRV[3] > 0 )) || return 2
+}
+need_routing() {
+  read_routing
+  case $? in
+    0) ;;
+    2) die "the live manager can't read the driver's factory WGP map, so extra WGPs can't be told apart. Check: sudo $LM status" ;;
+    *) die "couldn't read the WGP routing (log: $LOG). Is umr installed and debugfs mounted? Try: sudo $LM status" ;;
+  esac
+}
+cu_count() { local n=0 r i; for r in "$@"; do for i in 0 1 2 3 4; do (( r >> i & 1 )) && n=$(( n + 2 )); done; done; echo "$n"; }
+row_of()  { local se sh; IFS=. read -r se sh _ <<<"$1"; echo $(( se * 2 + sh )); }
+wgp_of()  { echo "${1##*.}"; }
+valid_wgp() { [[ $1 =~ ^[01]\.[01]\.[0-4]$ ]]; }
+candidates() {
+  local row i
+  for row in 0 1 2 3; do for i in 0 1 2 3 4; do
+    (( DRV[row] >> i & 1 )) || echo "$(( row / 2 )).$(( row % 2 )).$i"
+  done; done
+}
+extras_of_current() {
+  local row i
+  for row in 0 1 2 3; do for i in 0 1 2 3 4; do
+    (( CUR[row] >> i & 1 && !(DRV[row] >> i & 1) )) && echo "$(( row / 2 )).$(( row % 2 )).$i"
+  done; done
+}
+apply_set() {   # route the factory WGPs plus exactly the given extras, then check it took
+  local -a want=("${DRV[@]}")
+  local w row
+  lm stock-dispatch || return 1
+  if (( $# > 0 )); then lm enable-wgp "$@" || return 1; fi
+  (( DRY )) && return 0
+  for w in "$@"; do row=$(row_of "$w"); want[row]=$(( want[row] | 1 << $(wgp_of "$w") )); done
+  read_routing || return 1
+  [[ "${CUR[*]}" == "${want[*]}" ]]
+}
+restore_masks() {
+  local -a target=("$@") on=() off=()
+  local row i w
+  lm stock-dispatch || return 1
+  for row in 0 1 2 3; do for i in 0 1 2 3 4; do
+    w="$(( row / 2 )).$(( row % 2 )).$i"
+    if (( target[row] >> i & 1 && !(DRV[row] >> i & 1) )); then on+=("$w"); fi
+    if (( !(target[row] >> i & 1) && DRV[row] >> i & 1 )); then off+=("$w"); fi
+  done; done
+  (( ${#on[@]} == 0 )) || lm enable-wgp "${on[@]}" || return 1
+  (( ${#off[@]} == 0 )) || lm disable-wgp "${off[@]}" || return 1
+}
+
+# ---------- results: what<TAB>result<TAB>max_temp<TAB>detail<TAB>time ----------
+record() { mkdir -p "$CU_STATE"; printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$(date '+%F %T')" >>"$RESULTS"; }
+passing() { [[ -f $RESULTS ]] && awk -F'\t' '$1 ~ /^[01]\.[01]\.[0-4]$/ { r[$1] = $2 } END { for (w in r) if (r[w] == "PASS") print w }' "$RESULTS" | sort; }
+result_of() { [[ -f $RESULTS ]] && awk -F'\t' -v w="$1" '$1 == w { r = $2 } END { print r }' "$RESULTS"; }
+froze_on() { [[ -f $RESULTS ]] && awk -F'\t' -v w="$1" '$1 == w { d = $4 } END { exit !(d ~ /^board froze/) }' "$RESULTS"; }
+last_combined() { [[ -f $RESULTS ]] && awk -F'\t' '$1 ~ /^combined:/ { l = $1 "\t" $2 } END { print l }' "$RESULTS"; }
+soaked_set() { local c; c="$(last_combined)"; [[ ${c##*$'\t'} == PASS ]] || return 0; c="${c%%$'\t'*}"; echo "${c#combined:}"; }
+
+attribute_crash() {   # a test that froze the board leaves its marker behind from an earlier boot
+  [[ -f $INPROG ]] || return 0
+  local what bid k
+  read -r what bid <"$INPROG"
+  if [[ $bid != "$(boot_id)" ]]; then
+    k="$(journalctl -k -b -1 -o cat --no-pager 2>/dev/null | grep -iE 'ring .*timeout|gpu reset|device wedged|amdgpu.*(fault|hang)' | tail -n 3)"
+    fail "The last run was testing $what when the board stopped responding. Marking it failed."
+    [[ -n $k ]] && printf '%s\n' "$k" | sed 's/^/        /'
+    record "$what" FAIL "-" "board froze or rebooted during this test"
+  fi
+  rm -f "$INPROG"
+}
+
+# ---------- monitoring ----------
+GPU_TEMP="${GPU_TEMP:-}"
+if [[ -z $GPU_TEMP ]]; then _h=$(hwmon_by_name amdgpu) && GPU_TEMP="$_h/temp1_input"; fi
+WATCH_PID=""
+watch_start() {   # track max GPU temp; above TEMP_LIMIT drop to stock routing at once
+  mkdir -p "$RUN"; echo 0 >"$RUN/maxtemp"; rm -f "$RUN/hot"
+  [[ -n $GPU_TEMP ]] || return 0
+  local can_revert=0 me=$$; [[ -f $LM ]] && can_revert=1
+  ( while kill -0 "$me" 2>/dev/null; do   # stops by itself if this tool exits
+      t=$(( $(cat "$GPU_TEMP" 2>/dev/null || echo 0) / 1000 ))
+      (( t > $(cat "$RUN/maxtemp" 2>/dev/null || echo 0) )) && { echo "$t" >"$RUN/maxtemp.new"; mv -f "$RUN/maxtemp.new" "$RUN/maxtemp"; }
+      if (( t >= TEMP_LIMIT )) && [[ ! -e $RUN/hot ]]; then
+        touch "$RUN/hot"; (( can_revert )) && "$LM" --yes stock-dispatch >>"$LOG" 2>&1
+      fi
+      sleep 1
+    done ) >/dev/null 2>&1 &
+  WATCH_PID=$!
+  echo "$WATCH_PID" >"$RUN/watch.pid"   # test_one runs in a subshell, so cleanup reads it from here
+}
+watch_stop() {
+  local p="${WATCH_PID:-$(cat "$RUN/watch.pid" 2>/dev/null)}"
+  [[ -n $p ]] && { kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; }
+  rm -f "$RUN/watch.pid"; WATCH_PID=""
+}
+max_temp() { local m; m=$(cat "$RUN/maxtemp" 2>/dev/null); echo "${m:-0}"; }
+cool_down() {   # wait (up to 5 min) until the GPU is 15 °C under the limit
+  [[ -n $GPU_TEMP ]] || return 0
+  local t=0 c
+  while (( t < 300 )); do
+    c=$(( $(cat "$GPU_TEMP" 2>/dev/null || echo 0) / 1000 ))
+    (( c < TEMP_LIMIT - 15 )) && return 0
+    sleep 5; t=$(( t + 5 ))
+  done
+}
+gpu_errors_since() {
+  journalctl -k -S "@$1" -o cat --no-pager 2>/dev/null |
+    grep -iE 'ring [a-z_0-9.]+ timeout|gpu reset|reset (begin|succeeded|failed)|device wedged|amdgpu.*(page fault|protection_fault|hang)|\*ERROR\*.*(ring|fence)' | tail -n 3
+}
+run_verify() {   # 0 pass, 2 wrong results, 124 hang, else a Vulkan/setup error
+  timeout --kill-after=15 "$VERIFY_TIMEOUT" bash "$VERIFY" --passes "${1:-$PASSES}" >>"$LOG" 2>&1
+}
+
+# ---------- gpu-yield / Ollama (optional) ----------
+gy() {
+  [[ -n ${SUDO_USER:-} ]] || return 1
+  local uid; uid=$(id -u "$SUDO_USER")
+  [[ -x $USER_HOME/.local/bin/gpu-yield ]] || return 1
+  runuser -u "$SUDO_USER" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$USER_HOME/.local/bin/gpu-yield" "$@" >>"$LOG" 2>&1
+}
+gy_state() { curl -sf --max-time 3 "$GY_STATUS" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null; }
+ollama_up() { curl -sf --max-time 3 "$OLLAMA/api/version" >/dev/null 2>&1; }
+wait_ollama() { local t=0; while (( t < 300 )); do ollama_up && return 0; sleep 3; t=$(( t + 3 )); done; return 1; }
+ctx_len() { grep -oE '^context_length *= *[0-9]+' "$USER_HOME/.config/gpu-yield/config.toml" 2>/dev/null | grep -oE '[0-9]+$' || echo 8192; }
+resolve_model() {   # --model, else gpu-yield's alias, else the first model Ollama has
+  local names; names=$(curl -sf --max-time 5 "$OLLAMA/api/tags" 2>/dev/null | python3 -c 'import json,sys; [print(m["name"]) for m in json.load(sys.stdin).get("models",[])]' 2>/dev/null)
+  [[ -n $names ]] || return 1
+  if [[ -n $MODEL ]]; then grep -qxE "$MODEL(:latest)?" <<<"$names" && { echo "$MODEL"; return 0; }; return 1; fi
+  grep -qxE 'gpu-yield(:latest)?' <<<"$names" && { echo gpu-yield; return 0; }
+  head -n1 <<<"$names"
+}
+BENCH_PY=$(cat <<'PY'
+import json, random, sys, time, os, urllib.request
+url, model, ctx, lines, mode = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+def once(predict):
+    # A random first line means no earlier request shares a prefix, so the whole prompt is read.
+    body = "\n".join(f"Entry {i}: sensor {random.randint(0, 999)} read {random.random() * 100:.2f} "
+                     f"units at node {i % 37}, status {random.choice(['ok', 'drift', 'fault'])}."
+                     for i in range(lines))
+    prompt = f"Session {random.getrandbits(64):016x}.\n{body}\n\nSummary of the entries above:"
+    req = {"model": model, "prompt": prompt, "raw": True, "stream": False,
+           "options": {"num_ctx": ctx, "num_predict": predict, "temperature": 0.7}}
+    r = json.load(urllib.request.urlopen(urllib.request.Request(
+        url + "/api/generate", json.dumps(req).encode(), {"Content-Type": "application/json"}), timeout=1800))
+    return (r["prompt_eval_count"] / (r["prompt_eval_duration"] / 1e9),
+            r["eval_count"] / max(r["eval_duration"] / 1e9, 1e-9), r["prompt_eval_count"])
+if mode == "load":                     # soak: keep the GPU busy until the stop file appears
+    stop = sys.argv[6]
+    while not os.path.exists(stop):
+        try: once(64)
+        except Exception: time.sleep(5)
+else:
+    rd, wr, n = once(128)
+    print(f"{rd:.1f} {wr:.1f} {n}")
+PY
+)
+
+# ---------- cleanup for long runs ----------
+ORIG=()
+GY_PAUSED=0
+LOAD_PID=""
+cu_cleanup() {
+  watch_stop
+  [[ -n $LOAD_PID ]] && { touch "$RUN/stop-load"; kill "$LOAD_PID" 2>/dev/null; wait "$LOAD_PID" 2>/dev/null; LOAD_PID=""; }
+  if (( ${#ORIG[@]} == 4 )); then
+    restore_masks "${ORIG[@]}" || warn "couldn't restore the routing from before this run; run: sudo bc250-fixer cu apply stock"
+  fi
+  rm -f "$INPROG"
+  (( GY_PAUSED )) && { gy resume || warn "couldn't resume gpu-yield; run: gpu-yield resume"; }
+}
+
+governor_cap() {   # highest clock in the GPU governor's config, in MHz (0 if unknown)
+  local f max=0 v
+  for f in /etc/cyan-skillfish-governor-smu/config.toml /etc/cyan-skillfish-governor/config.toml; do
+    [[ -r $f ]] || continue
+    while read -r v; do (( v > max )) && max=$v; done < <(
+      { grep -oE 'frequency *= *[0-9]+' "$f" | grep -oE '[0-9]+$'
+        grep -oE '\[ *[0-9]{3,4} *, *[0-9]{3,4} *\]' "$f" | tr -d '[ ' | cut -d, -f1; } 2>/dev/null)
+  done
+  echo "$max"
+}
+
+cu_preflight() {
+  need_root cu
+  is_bc250 || die "this isn't a BC-250 (no PCI device 1002:13fe). --force overrides, at your own risk."
+  [[ -f $LM ]] || die "the compute-unit tools aren't installed; run: sudo bc250-fixer cu setup"
+  [[ -f $VERIFY ]] || die "the compute verifier isn't installed; run: sudo bc250-fixer cu setup"
+  have umr || [[ -x /usr/local/bin/umr ]] || die "umr isn't installed; run: sudo bc250-fixer cu setup"
+  local ld; ld="$(cat /sys/kernel/security/lockdown 2>/dev/null || echo '[none]')"
+  grep -q '\[none\]' <<<"$ld" || warn "kernel lockdown is on ($ld); umr may be blocked from the GPU registers. Turning Secure Boot off fixes it."
+  [[ -d /var/log/journal ]] || warn "the journal isn't persistent, so a test that freezes the board leaves no kernel log to read afterwards (sudo bc250-fixer fix journal)"
+}
+
+# Pick passing WGPs for a total CU count, spread evenly over the 4 shader arrays (work is
+# divided between arrays, so a lopsided layout leaves added CUs idle). Soaked ones first.
+pick_count() {
+  local total="$1" need w rest row i picked=0 cset
+  [[ $total =~ ^[0-9]+$ ]] || die "'$total' isn't a CU count"
+  (( total >= 24 && total <= 40 && total % 2 == 0 )) || die "CU counts go in pairs from 24 to 40 (24, 26, 28 ... 40); got $total"
+  need=$(( (total - 24) / 2 ))
+  (( need > 0 )) || return 0
+  cset=$(soaked_set)
+  local -a pool=() rows=("" "" "" "")
+  while read -r w; do [[ -n $w && ",$cset," == *",$w,"* ]] && pool+=("$w"); done < <(passing)
+  while read -r w; do [[ -n $w && ",$cset," != *",$w,"* ]] && pool+=("$w"); done < <(passing)
+  (( ${#pool[@]} >= need )) || die "only ${#pool[@]} WGP(s) have passed, so the most available is $(( 24 + 2 * ${#pool[@]} )) CUs (asked for $total). Run: sudo bc250-fixer cu test"
+  for w in "${pool[@]}"; do row=$(row_of "$w"); rows[row]+="$w "; done
+  while (( picked < need )); do
+    for i in 0 1 2 3; do
+      (( picked < need )) || break
+      read -r w rest <<<"${rows[i]}"
+      [[ -n ${w:-} ]] || continue
+      echo "$w"; rows[i]="${rest:-}"; picked=$(( picked + 1 ))
+    done
+  done
+}
+
+# soak_run LABEL: verifier loop for SOAK_SECONDS with heat load, temp watch and kernel-log
+# watch; sets SOAK_RES (PASS/FAIL) and SOAK_DETAIL, records the result under LABEL.
+soak_run() {
+  local label="$1" t0 end rc=0 n=0 errs model
+  echo "$label $(boot_id)" >"$INPROG"; sync
+  if ollama_up; then
+    if model=$(resolve_model); then
+      info "running Ollama prompts ($model) as heat load alongside the verifier"
+      rm -f "$RUN/stop-load"
+      python3 -c "$BENCH_PY" "$OLLAMA" "$model" "$(ctx_len)" "$BENCH_LINES" load "$RUN/stop-load" >>"$LOG" 2>&1 &
+      LOAD_PID=$!
+    else warn "no usable model in Ollama${MODEL:+ ('$MODEL')}; the soak uses the verifier only (lighter heat load)"; fi
+  else warn "Ollama isn't running; the soak uses the verifier only, which heats the GPU less than real use"; fi
+  t0=$(date +%s) end=$(( t0 + SOAK_SECONDS ))
+  watch_start
+  while (( $(date +%s) < end )); do
+    run_verify 4; rc=$?; n=$(( n + 1 ))
+    (( rc == 0 )) || break
+    [[ -e $RUN/hot ]] && break
+    errs="$(gpu_errors_since "$t0")"; [[ -n $errs ]] && break
+    [[ -t 1 ]] && printf '\r  %d verifier runs, %d min left, max %s °C   ' "$n" $(( (end - $(date +%s) + 59) / 60 )) "$(max_temp)"
+  done
+  [[ -t 1 ]] && printf '\n'
+  watch_stop
+  [[ -n $LOAD_PID ]] && { touch "$RUN/stop-load"; kill "$LOAD_PID" 2>/dev/null; wait "$LOAD_PID" 2>/dev/null; LOAD_PID=""; }
+  info "$n verifier runs, max $(max_temp) °C"
+  errs="$(gpu_errors_since "$t0")"
+  if [[ -e $RUN/hot ]]; then SOAK_RES=FAIL SOAK_DETAIL="reached $TEMP_LIMIT °C under sustained load"
+  elif [[ -n $errs ]]; then SOAK_RES=FAIL SOAK_DETAIL="GPU error: $(head -n1 <<<"$errs")"
+  elif (( rc == 2 )); then SOAK_RES=FAIL SOAK_DETAIL="wrong results under sustained load"
+  elif (( rc != 0 )); then SOAK_RES=FAIL SOAK_DETAIL="verifier error or hang (exit $rc)"
+  else SOAK_RES=PASS SOAK_DETAIL="$n verifier runs over $(( (SOAK_SECONDS + 59) / 60 )) min, all correct"; fi
+  record "$label" "$SOAK_RES" "$(max_temp)" "$SOAK_DETAIL"
+  rm -f "$INPROG"
+}
+
+# ---------- cu commands ----------
+cu_setup() {
+  need_root "cu setup"
+  start_log cu-setup
+  section "Installing packages"
+  case $(pkg_mgr) in
+    dnf|rpm-ostree) pkg_install git gcc glslang vulkan-headers vulkan-loader-devel vulkan-tools stress-ng pciutils python3 curl ;;
+    pacman) pkg_install git gcc glslang vulkan-headers vulkan-icd-loader vulkan-tools stress-ng pciutils python curl ;;
+    apt) pkg_install git gcc glslang-tools libvulkan-dev vulkan-tools stress-ng pciutils python3 curl ;;
+    *) die "no supported package manager; install git, gcc, glslangValidator, Vulkan headers and loader, vulkan-tools, stress-ng, pciutils, python3, curl" ;;
+  esac
+  section "Fetching the community tools (pinned commits)"
+  _fetch() {   # repo commit dir
+    if [[ "$(git -C "$3" rev-parse HEAD 2>/dev/null)" == "$2" ]]; then ok "$(basename "$3") already at ${2:0:7}"; return; fi
+    (( DRY )) && { printf '  %s[dry-run]%s would clone %s at %s into %s\n' "$Y" "$N" "$1" "${2:0:7}" "$3"; return; }
+    rm -rf "$3"; git clone -q "$1" "$3" || die "couldn't clone $1"
+    git -C "$3" -c advice.detachedHead=false checkout -q "$2" || die "commit $2 isn't in $1 any more"
+    [[ "$(git -C "$3" rev-parse HEAD)" == "$2" ]] || die "checkout of $1 didn't land on $2"
+    ok "$(basename "$3") at ${2:0:7}"
+  }
+  act mkdir -p "$TOOLS"
+  _fetch "$LM_REPO" "$LM_COMMIT" "$TOOLS/live"
+  _fetch "$DG_REPO" "$DG_COMMIT" "$TOOLS/duggasco"
+  (( DRY )) && return 0
+  chmod +x "$LM"
+  if ! have umr; then
+    info "installing umr through the live manager (dnf, rpm-ostree, pacman/paru or apt; apt builds it from source)"
+    "$LM" --yes install-umr || die "couldn't install umr"
+  fi
+  section "Checking they work on this board"
+  is_bc250 || die "this isn't a BC-250 (no PCI device 1002:13fe)"
+  need_routing
+  ok "routing readable: $(cu_count "${CUR[@]}")/40 CUs routed, factory map $(cu_count "${DRV[@]}") CUs"
+  info "extra WGPs available to test: $(candidates | tr '\n' ' ')"
+  printf '  running a quick correctness check at the current routing...\n'
+  if bash "$VERIFY" --elements 262144 --passes 1 >>"$LOG" 2>&1; then ok "compute verifier builds and passes"
+  else die "the compute verifier failed at the current routing (log: $LOG)"; fi
+  printf '\n  Next: sudo bc250-fixer cu test   (about 25-35 min)\n'
+}
+
+cu_status() {
+  cu_preflight
+  start_log cu-status
+  "$LM" status 2>&1 | sed '/^$/d'
+  section "Board"
+  [[ -n $GPU_TEMP ]] && info "GPU edge temperature: $(( $(cat "$GPU_TEMP") / 1000 )) °C"
+  local cap; cap=$(governor_cap)
+  if (( cap == 0 )); then warn "couldn't read the GPU governor's clock cap"
+  elif (( cap > 1500 )); then warn "GPU governor allows up to $cap MHz. With extra CUs the community advice is 1500 MHz @ 900 mV: at 2 GHz and 40 CUs boards reached 96-107 °C."
+  else ok "GPU governor capped at $cap MHz"; fi
+  section "Test results"
+  if [[ -s $RESULTS ]]; then
+    awk -F'\t' '{ r[$1] = $2 "\t" $3 "\t" $4 "\t" $5 } END { for (w in r) print w "\t" r[w] }' "$RESULTS" | sort |
+      awk -F'\t' '{ printf "  %-10s %-5s max %3s °C  %s  (%s)\n", $1, $2, ($3 == "" ? "-" : $3), $4, $5 }'
+  else info "no tests run yet"; fi
+  section "Persistence"
+  if systemctl is-enabled -q "$LM_UNIT" 2>/dev/null; then
+    ok "routing is applied at boot ($LM_UNIT)"
+    [[ -f $CU_STATE/tripped ]] && fail "the crash guard tripped: the unlock is NOT being applied at boot. Fix the cause, then run persist again."
+    [[ -f $CU_STATE/strikes ]] && info "unclean shutdowns in a row while unlocked: $(cat "$CU_STATE/strikes")"
+  else info "not persisted: routing returns to the factory 24 CUs at every boot"; fi
+}
+
+cu_test() {
+  no_dry "cu test"
+  cu_preflight
+  start_log cu-test
+  attribute_crash
+  need_routing
+  ORIG=("${CUR[@]}")
+  trap 'cu_cleanup' EXIT
+  trap 'exit 130' INT TERM
+  local -a list=()
+  local w skipped=()
+  if (( $# > 0 )); then
+    for w in "$@"; do
+      valid_wgp "$w" || die "'$w' isn't a WGP (use SE.SH.WGP, e.g. 1.0.4)"
+      candidates | grep -qx "$w" || die "$w is a factory WGP, already enabled at boot; only extras are tested"
+      list+=("$w")
+    done
+  else
+    while read -r w; do if froze_on "$w"; then skipped+=("$w"); else list+=("$w"); fi; done < <(candidates)
+    (( ${#skipped[@]} == 0 )) || warn "skipping ${skipped[*]}: it froze the board last time. Name it to test it again: sudo bc250-fixer cu test ${skipped[0]}"
+  fi
+  (( ${#list[@]} > 0 )) || die "no extra WGPs to test"
+  local cap; cap=$(governor_cap)
+  (( cap > 1500 )) && warn "GPU governor allows up to $cap MHz; extra CUs at that clock can overheat (advice: 1500 MHz @ 900 mV)"
+  [[ -n $GPU_TEMP ]] || warn "no GPU temperature sensor found; overheating can't abort a test"
+
+  section "Plan"
+  info "test ${#list[@]} extra WGP(s), each alone on top of the factory 24 CUs: ${list[*]}"
+  info "$ROUNDS round(s) of $PASSES verifier passes each; abort above $TEMP_LIMIT °C; then a $(( (SOAK_SECONDS + 59) / 60 ))-minute soak of the passing ones"
+  info "log: $LOG"
+  if [[ $(gy_state) == ai ]]; then
+    info "pausing gpu-yield, so no AI request runs on an untested WGP"
+    gy pause && GY_PAUSED=1 || warn "couldn't pause gpu-yield; requests may arrive during the tests"
+  elif ollama_up; then
+    warn "Ollama is running; requests that arrive during the tests could get wrong answers from a bad WGP"
+  fi
+
+  test_one() {   # label, extras...; echoes PASS or FAIL and records the result
+    local label="$1"; shift
+    local t0 rc=0 r errs res detail
+    cool_down
+    echo "$label $(boot_id)" >"$INPROG"; sync
+    sleep 1; t0=$(date +%s)   # so a kernel message from the previous test can't land in this one
+    if ! apply_set "$@"; then record "$label" FAIL - "routing didn't take"; echo FAIL; return; fi
+    watch_start
+    for (( r = 1; r <= ROUNDS; r++ )); do
+      run_verify; rc=$?
+      (( rc == 0 )) || break
+      [[ -e $RUN/hot ]] && break
+    done
+    watch_stop
+    errs="$(gpu_errors_since "$t0")"
+    read_routing
+    local -a want=("${DRV[@]}"); local w row
+    for w in "$@"; do row=$(row_of "$w"); want[row]=$(( want[row] | 1 << $(wgp_of "$w") )); done
+    if [[ -e $RUN/hot ]]; then res=FAIL detail="reached $TEMP_LIMIT °C"
+    elif [[ -n $errs ]]; then res=FAIL detail="GPU error: $(head -n1 <<<"$errs")"
+    elif (( rc == 2 )); then res=FAIL detail="wrong results (GPU output didn't match the CPU)"
+    elif (( rc == 124 || rc == 137 )); then res=FAIL detail="hung (no result in ${VERIFY_TIMEOUT}s)"
+    elif (( rc != 0 )); then res=FAIL detail="verifier error (exit $rc); see log"
+    elif [[ "${CUR[*]}" != "${want[*]}" ]]; then res=FAIL detail="routing changed during the test (a GPU reset?)"
+    else res=PASS detail="$(( r - 1 )) x $PASSES passes, all correct"; fi
+    record "$label" "$res" "$(max_temp)" "$detail"
+    rm -f "$INPROG"
+    echo "$res"
+  }
+
+  section "Baseline: factory 24 CUs"
+  local res
+  res=$(test_one stock)
+  if [[ $res != PASS ]]; then
+    fail "the board fails at stock routing: $(awk -F'\t' 'END { print $4 }' "$RESULTS")"
+    die "fix stability at stock (clocks, cooling, PSU) before unlocking anything"
+  fi
+  ok "stock routing passes (max $(max_temp) °C)"
+
+  section "Extra WGPs, one at a time"
+  local pass=()
+  for w in "${list[@]}"; do
+    printf '  %-8s (CUs %s-%s) ... ' "$w" $(( $(wgp_of "$w") * 2 )) $(( $(wgp_of "$w") * 2 + 1 ))
+    res=$(test_one "$w" "$w")
+    if [[ $res == PASS ]]; then printf '%sPASS%s  max %s °C\n' "$G" "$N" "$(max_temp)"; pass+=("$w")
+    else printf '%sFAIL%s  %s\n' "$R" "$N" "$(awk -F'\t' 'END { print $4 }' "$RESULTS")"; fi
+  done
+  (( ${#pass[@]} > 0 )) || { fail "no extra WGP passed; staying at 24 CUs"; return 1; }
+
+  cool_down
+  section "Soak: all ${#pass[@]} passing WGP(s) together for $(( (SOAK_SECONDS + 59) / 60 )) min ($(( 24 + 2 * ${#pass[@]} )) CUs)"
+  apply_set "${pass[@]}" || die "couldn't apply the passing set"
+  local resumed=0
+  if (( GY_PAUSED )); then gy resume && { GY_PAUSED=0; resumed=1; }; fi
+  (( resumed )) && wait_ollama
+  soak_run "combined:$(IFS=,; echo "${pass[*]}")"
+
+  section "Summary"
+  if [[ $SOAK_RES == PASS ]]; then
+    ok "$(( 24 + 2 * ${#pass[@]} )) CUs passed together: ${pass[*]} (max $(max_temp) °C)"
+    printf '\n  The routing is back to how it was before the test. Next:\n'
+    printf '    sudo bc250-fixer cu apply passing   # or a count, e.g. apply 32 (until reboot)\n'
+    printf '    sudo bc250-fixer cu bench           # measure the speed-up in Ollama\n'
+    printf '    sudo bc250-fixer cu persist         # keep it across reboots\n'
+  else
+    fail "each passed alone, but together: $SOAK_DETAIL"
+    info "usually heat or power, not a bad CU. Try fewer: sudo bc250-fixer cu test <some of: ${pass[*]}>, or apply a lower count"
+    info "or lower the GPU clock cap in the governor config"
+  fi
+}
+
+cu_apply() {
+  cu_preflight
+  start_log cu-apply
+  need_routing
+  local -a set=()
+  local w picked
+  case "${1:-passing}" in
+    stock) ;;
+    passing) mapfile -t set < <(passing); (( ${#set[@]} > 0 )) || die "no passing WGPs on record; run: sudo bc250-fixer cu test" ;;
+    all) mapfile -t set < <(candidates) ;;
+    [0-9]*) picked="$(pick_count "${1%[cC][uU]*}")" || exit 1
+            [[ -z $picked ]] || mapfile -t set <<<"$picked" ;;
+    *) for w in "$@"; do valid_wgp "$w" || die "'$w' isn't a WGP (SE.SH.WGP)"; set+=("$w"); done ;;
+  esac
+  local untested=() outside=() cset
+  for w in "${set[@]}"; do [[ "$(result_of "$w")" == PASS ]] || untested+=("$w"); done
+  (( ${#untested[@]} == 0 )) || warn "not tested or failed: ${untested[*]}. A bad WGP gives wrong answers or hangs the GPU."
+  cset=$(soaked_set)
+  for w in "${set[@]}"; do [[ ",$cset," == *",$w,"* ]] || outside+=("$w"); done
+  (( ${#outside[@]} == 0 || ${#set[@]} == 0 )) || warn "${outside[*]} weren't in the last passing soak, so this combination is untested under sustained load"
+  apply_set "${set[@]}" || die "routing didn't take (log: $LOG)"
+  (( DRY )) && return 0
+  ok "routing now: $(cu_count "${CUR[@]}")/40 CUs. This lasts until reboot; run persist to keep it."
+}
+
+cu_bench() {
+  no_dry "cu bench"
+  cu_preflight
+  start_log cu-bench
+  need_routing
+  ORIG=("${CUR[@]}")
+  trap 'cu_cleanup' EXIT
+  trap 'exit 130' INT TERM
+  local -a set=()
+  mapfile -t set < <(extras_of_current)
+  if (( ${#set[@]} == 0 )); then
+    mapfile -t set < <(passing)
+    (( ${#set[@]} > 0 )) || die "nothing to compare: the routing is stock and no test results exist. Run: sudo bc250-fixer cu test"
+  fi
+  if ! ollama_up; then
+    [[ $(gy_state) == paused ]] && { gy resume || true; }
+    wait_ollama || die "Ollama isn't answering on $OLLAMA (the benchmark uses Ollama)"
+  fi
+  local model ctx label rd wr n best_rd best_wr i
+  model=$(resolve_model) || die "no usable model in Ollama${MODEL:+ ('$MODEL')}; set --model NAME"
+  ctx=$(ctx_len)
+  section "Ollama speed: $model, context $ctx, ~$BENCH_LINES-line prompts, $BENCH_RUNS runs each"
+  info "each run reads a fresh prompt (nothing cached); the first run per setting is a warm-up"
+  declare -A RD WR
+  for label in stock unlocked; do
+    if [[ $label == stock ]]; then apply_set || die "couldn't set stock routing"
+    else apply_set "${set[@]}" || die "couldn't apply ${set[*]}"; fi
+    printf '  %-9s %2s CUs: ' "$label" "$(cu_count "${CUR[@]}")"
+    python3 -c "$BENCH_PY" "$OLLAMA" "$model" "$ctx" 8 once >>"$LOG" 2>&1
+    best_rd=0 best_wr=0
+    for (( i = 0; i < BENCH_RUNS; i++ )); do
+      read -r rd wr n < <(python3 -c "$BENCH_PY" "$OLLAMA" "$model" "$ctx" "$BENCH_LINES" once 2>>"$LOG")
+      [[ -n ${rd:-} ]] || die "a benchmark request failed (log: $LOG)"
+      awk -v a="$rd" -v b="$best_rd" 'BEGIN { exit !(a > b) }' && best_rd=$rd
+      awk -v a="$wr" -v b="$best_wr" 'BEGIN { exit !(a > b) }' && best_wr=$wr
+    done
+    RD[$label]=$best_rd WR[$label]=$best_wr
+    printf 'reading %6s tok/s   writing %5s tok/s   (prompt %s tokens)\n' "$best_rd" "$best_wr" "$n"
+  done
+  section "Result"
+  awk -v a="${RD[unlocked]}" -v b="${RD[stock]}" -v c="${WR[unlocked]}" -v d="${WR[stock]}" \
+    'BEGIN { printf "  reading x%.2f, writing x%.2f with the unlocked WGPs\n", a / b, c / d }'
+  info "reading scales with compute, so it gains most; writing is mostly limited by memory bandwidth"
+}
+
+cu_persist() {
+  cu_preflight
+  start_log cu-persist
+  need_routing
+  local -a set; mapfile -t set < <(extras_of_current)
+  (( ${#set[@]} > 0 )) || die "the current routing is stock, so there's nothing to persist. Run: sudo bc250-fixer cu apply passing (or a count)"
+  if [[ $FORCE != 1 ]]; then
+    local w cset
+    for w in "${set[@]}"; do
+      [[ "$(result_of "$w")" == PASS ]] || die "$w hasn't passed a test. Test it first, or --force to persist anyway."
+    done
+    cset=$(soaked_set)
+    [[ -n $cset ]] || die "the last combined soak didn't pass. Run the test again, or --force."
+    for w in "${set[@]}"; do [[ ",$cset," == *",$w,"* ]] || die "$w wasn't part of the soaked set ($cset). Re-run the test, or --force."; done
+  fi
+  # Crash guard: the guard unit clears the "armed" marker on clean shutdown. If the board
+  # comes up with the marker still there, the last boot ended badly while unlocked; after
+  # two of those in a row, boot-guard stops the unlock from being applied.
+  [[ $SELF == "$INSTALL_PATH" ]] || act install -D -m 0755 "$SELF" "$INSTALL_PATH" ||
+    die "couldn't install this tool at $INSTALL_PATH, which the boot guard runs. Nothing is applied at boot."
+  write_file "$SYSTEMD_DIR/$GUARD_UNIT" <<EOF
+[Unit]
+Description=BC-250 CU unlock crash guard (clears its marker on clean shutdown)
+After=local-fs.target
+Before=$LM_UNIT
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/bin/rm -f $CU_STATE/armed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_file "$SYSTEMD_DIR/$LM_UNIT.d/crash-guard.conf" <<EOF
+[Unit]
+Wants=$GUARD_UNIT
+After=$GUARD_UNIT
+
+[Service]
+ExecCondition=$INSTALL_PATH cu boot-guard
+EOF
+  # the guard is in place before the boot service that it guards
+  lm write-service-table || die "couldn't save the table (log: $LOG)"
+  lm install-service || die "couldn't install the boot service (log: $LOG)"
+  act rm -f "$CU_STATE/tripped" "$CU_STATE/strikes"
+  act mkdir -p "$CU_STATE"; act touch "$CU_STATE/armed"   # this boot is now running unlocked too
+  act systemctl daemon-reload
+  act systemctl enable -q --now "$GUARD_UNIT" || die "couldn't enable $GUARD_UNIT"
+  (( DRY )) && return 0
+  ok "routing $(cu_count "${CUR[@]}")/40 CUs is applied at every boot (${set[*]})"
+  info "crash guard on: after 2 unclean shutdowns in a row while unlocked, boot stays at 24 CUs"
+  info "a power cut also counts as unclean; two in a row trip it (status shows it)"
+}
+
+cu_unpersist() {
+  need_root "cu unpersist"
+  start_log cu-unpersist
+  [[ -f $LM ]] && { lm uninstall-service || warn "the live manager couldn't remove its service (log: $LOG)"; }
+  act systemctl disable -q --now "$GUARD_UNIT" 2>/dev/null
+  act rm -f "$SYSTEMD_DIR/$GUARD_UNIT" "$SYSTEMD_DIR/$LM_UNIT.d/crash-guard.conf" "$CU_STATE/armed" "$CU_STATE/strikes" "$CU_STATE/tripped"
+  act rmdir "$SYSTEMD_DIR/$LM_UNIT.d" 2>/dev/null
+  act systemctl daemon-reload
+  did "no longer applied at boot. The current routing stays until reboot; for stock now: sudo bc250-fixer cu apply stock"
+}
+
+cu_boot_guard() {   # ExecCondition of the live manager's boot service; exit 0 = apply, 1 = skip
+  mkdir -p "$CU_STATE"
+  if [[ -f $CU_STATE/tripped ]]; then
+    logger -t bc250-fixer "crash guard tripped earlier: not applying the CU unlock (run 'bc250-fixer cu persist' to re-arm)"
+    exit 1
+  fi
+  local strikes=0
+  [[ -f $CU_STATE/armed ]] && strikes=$(( $(cat "$CU_STATE/strikes" 2>/dev/null || echo 0) + 1 ))
+  echo "$strikes" >"$CU_STATE/strikes"
+  if (( strikes >= 2 )); then
+    touch "$CU_STATE/tripped"; rm -f "$CU_STATE/armed"; sync
+    logger -t bc250-fixer "2 unclean shutdowns in a row while unlocked: booting at stock 24 CUs"
+    exit 1
+  fi
+  touch "$CU_STATE/armed"; sync
+  exit 0
+}
+
+cmd_cu() {
+  local sub="${1:-status}"; shift || true
+  case $sub in
+    setup) cu_setup ;; status) cu_status ;; test) cu_test "$@" ;; apply) cu_apply "$@" ;;
+    bench) cu_bench ;; persist) cu_persist ;; unpersist) cu_unpersist ;; boot-guard) cu_boot_guard ;;
+    *) die "usage: bc250-fixer cu setup|status|test [WGP...]|apply N|passing|all|stock|WGP...|bench|persist|unpersist" ;;
+  esac
+}
+
+# =====================================================================================
+# cpu: the 2 CPU cores disabled at the factory (through the live manager)
+# =====================================================================================
+cmd_cpu() {
+  local sub="${1:-}"; shift || true
+  case $sub in
+    unlock)
+      cu_preflight
+      start_log cpu-unlock
+      local n; n=$(( $(cut -d- -f2 /sys/devices/system/cpu/present) + 1 ))
+      (( n >= 16 )) && { ok "all 8 cores (16 threads) are already present. Test them: sudo bc250-fixer cpu test"; return; }
+      warn "the 2 extra cores were disabled at the factory, possibly for a reason. The unlock briefly stops the GPU governor."
+      warn "a cold boot (power off, power cut) returns to 6 cores; a normal reboot keeps the unlock"
+      info "for llama.cpp/Ollama on the GPU, extra CPU cores make little difference"
+      ask "Unlock the 2 CPU cores?" || { info "cancelled"; return; }
+      if (( DRY )); then printf '  %s[dry-run]%s live-manager cpu-unlock\n' "$Y" "$N"; return; fi
+      "$LM" --yes cpu-unlock 2>&1 | tee -a "$LOG" | grep -E 'OK|WARN|ERR' | sed 's/^/  /'
+      (( PIPESTATUS[0] == 0 )) || die "the live manager's CPU unlock failed (log: $LOG); nothing to reboot for"
+      [[ -w /sys/kernel/reboot/mode ]] && echo warm >/sys/kernel/reboot/mode
+      printf '\n  Reboot with: sudo systemctl reboot   (not a power-off)\n  Then test:   sudo bc250-fixer cpu test\n' ;;
+    test)
+      no_dry "cpu test"
+      need_root "cpu test"
+      have stress-ng || die "stress-ng isn't installed (sudo bc250-fixer cu setup installs it)"
+      start_log cpu-test
+      local secs="${1:-20}" n cpu fails=() t0 ct hw="" maxc=0 k sp
+      [[ $secs =~ ^[0-9]+$ ]] || die "seconds must be a number"
+      n=$(( $(cut -d- -f2 /sys/devices/system/cpu/present) + 1 ))
+      section "CPU stress test: $n threads, ${secs}s each with result checking, then 60s all together"
+      hw=$(hwmon_by_name k10temp) && hw="$hw/temp1_input"
+      t0=$(date +%s)
+      for (( cpu = 0; cpu < n; cpu++ )); do
+        printf '  cpu%-3s ... ' "$cpu"
+        if [[ "$(cat /sys/devices/system/cpu/cpu$cpu/online 2>/dev/null || echo 1)" != 1 ]]; then printf 'offline\n'; fails+=("cpu$cpu(offline)"); continue; fi
+        if taskset -c "$cpu" stress-ng --cpu 1 --cpu-method all --verify --timeout "${secs}s" >>"$LOG" 2>&1; then printf '%sPASS%s\n' "$G" "$N"
+        else printf '%sFAIL%s\n' "$R" "$N"; fails+=("cpu$cpu"); fi
+      done
+      printf '  all threads, 60s ... '
+      stress-ng --cpu 0 --cpu-method all --verify --timeout 60s >>"$LOG" 2>&1 & sp=$!
+      while kill -0 "$sp" 2>/dev/null; do
+        [[ -n $hw ]] && { ct=$(( $(cat "$hw") / 1000 )); (( ct > maxc )) && maxc=$ct; }
+        sleep 1
+      done
+      if wait "$sp"; then printf '%sPASS%s  (CPU max %s °C)\n' "$G" "$N" "$maxc"; else printf '%sFAIL%s\n' "$R" "$N"; fails+=(all-threads); fi
+      k="$(journalctl -k -S "@$t0" -o cat --no-pager 2>/dev/null | grep -iE 'machine check|mce:|hardware error' | tail -n 3)"
+      [[ -n $k ]] && { fail "CPU hardware errors in the kernel log:"; sed 's/^/        /' <<<"$k"; fails+=(mce); }
+      (( n > 12 )) && [[ ! -d /sys/devices/system/cpu/cpu12/cpuidle ]] &&
+        warn "cpu12+ have no idle states (the firmware's ACPI tables describe only 6 cores), so they can't sleep: more idle power and heat"
+      if (( ${#fails[@]} == 0 )); then ok "all $n threads passed"
+      else fail "failures: ${fails[*]}. A cold boot (power off for 10 s) returns to the stock 6 cores."; fi
+      info "log: $LOG" ;;
+    *) die "usage: bc250-fixer cpu unlock | test [SECONDS]" ;;
+  esac
+}
+
+# =====================================================================================
+# soak: stability soak at the current settings
+# =====================================================================================
+cmd_soak() {
+  no_dry soak
+  need_root soak
+  [[ -f $VERIFY ]] || die "the GPU verifier isn't installed; run: sudo bc250-fixer cu setup"
+  if [[ -n ${1:-} ]]; then
+    [[ $1 =~ ^[0-9]+$ && $1 -gt 0 ]] || die "minutes must be a whole number"
+    SOAK_SECONDS=$(( $1 * 60 ))
+  fi
+  start_log soak
+  attribute_crash
+  local cus="?"
+  if [[ -f $LM ]] && read_routing; then cus=$(cu_count "${CUR[@]}"); fi
+  trap 'cu_cleanup' EXIT
+  trap 'exit 130' INT TERM
+  section "Stability soak: $(( (SOAK_SECONDS + 59) / 60 )) min at the current settings ($cus CUs)"
+  info "GPU results are checked against the CPU; the kernel log is watched for GPU errors; abort above $TEMP_LIMIT °C"
+  [[ -f $LM ]] || info "(without the cu tools, overheating is reported but the CUs can't be dropped to stock automatically)"
+  soak_run "soak:${cus}cu"
+  section "Result"
+  if [[ $SOAK_RES == PASS ]]; then ok "stable: $SOAK_DETAIL (max $(max_temp) °C)"
+  else fail "$SOAK_DETAIL"; info "log: $LOG"; fi
+}
+
+# =====================================================================================
+# monitor: live clocks, temperatures, power and memory
+# =====================================================================================
+cmd_monitor() {
+  local card hw cpu_hw gtt_t i=0 now mhz gt pw gttu ra sw ct line
+  card=$(gpu_card) || die "no AMD GPU found under /sys/class/drm"
+  hw=$(hwmon_by_name amdgpu || true); cpu_hw=$(hwmon_by_name k10temp || true)
+  gtt_t=$(cat "$card/mem_info_gtt_total" 2>/dev/null || echo 0)
+  [[ -n $MONLOG && ! -s $MONLOG ]] && echo "time,gpu_mhz,gpu_c,watts,gtt_used_gib,ram_avail_gib,swap_used_gib,cpu_c" >"$MONLOG"
+  printf '%s%-8s %7s %6s %6s %15s %10s %8s %6s%s\n' "$B" time GPU-MHz GPU-°C Watts "GTT used/total" RAM-avail Swap CPU-°C "$N"
+  while :; do
+    now=$(date +%T)
+    mhz=$(grep '\*' "$card/pp_dpm_sclk" 2>/dev/null | grep -oE '[0-9]+' | tail -n1)
+    gt=$( [[ -n $hw ]] && echo $(( $(cat "$hw/temp1_input" 2>/dev/null || echo 0) / 1000 )) )
+    pw=$( [[ -n $hw ]] && awk -v x="$(cat "$hw/power1_average" 2>/dev/null || cat "$hw/power1_input" 2>/dev/null || echo 0)" 'BEGIN{printf "%.0f", x/1e6}' )
+    gttu=$(cat "$card/mem_info_gtt_used" 2>/dev/null || echo 0)
+    ra=$(awk '/^MemAvailable:/{print $2*1024}' /proc/meminfo)
+    sw=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{print (t-f)*1024}' /proc/meminfo)
+    ct=$( [[ -n $cpu_hw ]] && echo $(( $(cat "$cpu_hw/temp1_input" 2>/dev/null || echo 0) / 1000 )) )
+    printf '%-8s %7s %6s %6s %7s/%-7s %10s %8s %6s\n' "$now" "${mhz:--}" "${gt:--}" "${pw:--}" \
+      "$(gib "$gttu")" "$(gib "$gtt_t")" "$(gib "$ra")" "$(gib "$sw")" "${ct:--}"
+    if [[ -n $MONLOG ]]; then
+      line="$now,${mhz:-},${gt:-},${pw:-},$(gib "$gttu"),$(gib "$ra"),$(gib "$sw"),${ct:-}"
+      echo "$line" >>"$MONLOG"
+    fi
+    i=$(( i + 1 )); (( COUNT > 0 && i >= COUNT )) && break
+    sleep "$INTERVAL"
+  done
+}
+
+# =====================================================================================
+# llama: build llama.cpp with Vulkan, and benchmark a model
+# =====================================================================================
+llama_dir() { echo "${LLAMA_DIR:-$USER_HOME/llama.cpp}"; }
+cmd_llama() {
+  local sub="${1:-}"; shift || true
+  local dir; dir=$(llama_dir)
+  case $sub in
+    build)
+      if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        section "Build dependencies"
+        case $(pkg_mgr) in
+          dnf|rpm-ostree) pkg_install git cmake gcc-c++ make vulkan-headers vulkan-loader-devel glslc spirv-headers-devel ;;
+          pacman) pkg_install git cmake base-devel vulkan-headers vulkan-icd-loader shaderc spirv-headers ;;
+          apt) pkg_install git cmake build-essential libvulkan-dev glslc spirv-headers ;;
+          *) warn "no supported package manager: make sure git, cmake, a C++ compiler, Vulkan headers, glslc and spirv-headers are installed" ;;
+        esac
+        [[ -z ${SUDO_USER:-} ]] && warn "building as root; run it with sudo from your normal user to keep $dir owned by you"
+      else info "not root: skipping dependency install (run with sudo to install them)"; fi
+      section "llama.cpp (master) with Vulkan in $dir"
+      if [[ -d $dir/.git ]]; then
+        act as_user git -C "$dir" fetch --quiet origin || die "git fetch failed"
+        act as_user git -C "$dir" checkout --quiet master
+        act as_user git -C "$dir" merge --ff-only --quiet origin/master || die "local changes in $dir block a fast-forward update"
+      else
+        act as_user git clone https://github.com/ggml-org/llama.cpp "$dir" || die "clone failed"
+      fi
+      local jobs avail
+      jobs=$(nproc); avail=$(awk '/^MemAvailable:/{print $2*1024}' /proc/meminfo)
+      (( avail < 4*GiB )) && { jobs=2; warn "only $(gib "$avail") GiB free (a model loaded?): building with 2 jobs to avoid running out of memory"; }
+      act as_user cmake -S "$dir" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF || die "cmake configure failed"
+      act as_user cmake --build "$dir/build" --config Release -j "$jobs" --target llama-server llama-bench llama-cli || die "build failed"
+      (( DRY )) && return 0
+      local v
+      v=$("$dir/build/bin/llama-server" --version 2>&1 | grep -oE 'version: [0-9]+' | grep -oE '[0-9]+' | head -n1)
+      [[ -z $v || $v == 0 ]] && v=$(as_user git -C "$dir" rev-list --count HEAD 2>/dev/null)   # 0 = no git info in the binary
+      if [[ -n $v ]] && (( v >= MIN_LLAMA_BUILD )); then ok "llama.cpp build $v"
+      else warn "build number ${v:-unknown} (want >= $MIN_LLAMA_BUILD)"; fi
+      "$dir/build/bin/llama-server" --list-devices 2>&1 | grep -E 'Vulkan[0-9]' | sed 's/^ */       /' || warn "llama.cpp didn't list a Vulkan device"
+      info "binaries: $dir/build/bin (llama-server, llama-bench, llama-cli)" ;;
+    bench)
+      no_dry "llama bench"
+      local model="${1:-}" bin help sz avail
+      [[ -f $model ]] || die "usage: bc250-fixer llama bench MODEL.gguf"
+      bin="$dir/build/bin/llama-bench"
+      [[ -x $bin ]] || die "llama-bench isn't built; run: sudo bc250-fixer llama build"
+      sz=$(stat -c %s "$model"); avail=$(awk '/^MemAvailable:/{print $2*1024}' /proc/meminfo)
+      if (( sz + 3*GiB / 2 > avail )) && [[ $FORCE != 1 ]]; then
+        die "$(gib "$sz") GiB model, $(gib "$avail") GiB free: stop whatever holds memory (Ollama, llama-server) first, or --force"
+      fi
+      local -a a=(-m "$model" -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -p 512 -n 128 -r 2)
+      help=$("$bin" --help 2>&1 || true)
+      if grep -q -- '--load-mode' <<<"$help"; then a+=(-lm none); elif grep -q -- '-mmp' <<<"$help"; then a+=(-mmp 0); fi
+      section "llama-bench: prompt reading (pp512) and writing (tg128), q8_0 context, fully on the GPU"
+      as_user "$bin" "${a[@]}" ;;
+    *) die "usage: bc250-fixer llama build | bench MODEL.gguf" ;;
+  esac
+}
+
+# =====================================================================================
+# report: support bundle with identifying details blanked
+# =====================================================================================
+cmd_report() {
+  no_dry report
+  need_root report
+  local stamp tmp d out host fqdn f
+  stamp=$(date +%Y%m%d-%H%M%S)
+  tmp=$(mktemp -d); d="$tmp/bc250-fixer-report-$stamp"; mkdir -p "$d"
+  section "Collecting"
+  info "health check..."; ( cmd_check ) 2>&1 | strip_color >"$d/check.txt"
+  info "memory split..."; ( vram_diag ) 2>&1 | strip_color >"$d/vram.txt"
+  if [[ -f $LM ]]; then info "compute units..."; "$LM" status 2>&1 | strip_color >"$d/cu-status.txt"; fi
+  [[ -f $RESULTS ]] && cp "$RESULTS" "$d/cu-results.tsv"
+  info "system details..."
+  {
+    echo "== bc250-fixer $VERSION, $(date)"; echo "== uname"; uname -a
+    echo "== os-release"; cat /etc/os-release 2>/dev/null
+    echo "== cmdline"; cat /proc/cmdline
+    echo "== firmware"; for f in bios_vendor bios_version bios_date board_name product_name; do printf '%s: %s\n' "$f" "$(cat /sys/class/dmi/id/$f 2>/dev/null)"; done
+    echo "== lspci (GPU)"; lspci -nnk 2>/dev/null | grep -A3 -iE 'vga|display'
+    echo "== memory"; free -h; cat /proc/meminfo | head -n 20; swapon --show 2>/dev/null
+    echo "== ttm"; grep -H . /sys/module/ttm/parameters/* 2>/dev/null
+    echo "== amdgpu sysfs"; local c; c=$(gpu_card) && grep -H . "$c"/mem_info_* "$c"/pp_dpm_sclk 2>/dev/null
+    echo "== modprobe.d / tmpfiles.d (ttm, amdgpu)"; grep -rsH -E 'ttm|amdgpu' /etc/modprobe.d /etc/tmpfiles.d /usr/lib/tmpfiles.d 2>/dev/null
+    echo "== governor"; for f in /etc/cyan-skillfish-governor-smu/config.toml /etc/cyan-skillfish-governor/config.toml; do [[ -r $f ]] && { echo "-- $f"; cat "$f"; }; done
+    systemctl status cyan-skillfish-governor-smu --no-pager -n 5 2>/dev/null
+    echo "== boot target"; systemctl get-default
+    echo "== vulkan"; vulkaninfo --summary 2>/dev/null | head -n 60
+    echo "== sensors"; have sensors && sensors 2>/dev/null
+    echo "== lockdown"; cat /sys/kernel/security/lockdown 2>/dev/null
+  } >"$d/system.txt" 2>&1
+  info "kernel logs..."
+  journalctl --list-boots --no-pager 2>/dev/null | tail -n 15 >"$d/boots.txt"
+  journalctl -k -b 0 -o short-iso --no-pager 2>/dev/null | tail -n 3000 >"$d/kernel-this-boot.txt"
+  journalctl -k -b -1 -o short-iso --no-pager 2>/dev/null | tail -n 1500 >"$d/kernel-previous-boot.txt"
+  section "Blanking identifying details"
+  host=$(hostname -s 2>/dev/null || hostname); fqdn=$(hostname -f 2>/dev/null || echo "$host")
+  for f in "$d"/*; do
+    sed -i -E \
+      -e "s/\b${fqdn//./\\.}\b/<host>/g" -e "s/\b${host//./\\.}\b/<host>/g" \
+      -e "s#/home/${USER_NAME}\b#/home/<user>#g" -e "s/\b${USER_NAME}@/<user>@/g" \
+      -e 's/\b([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b/xx:xx:xx:xx:xx:xx/g' \
+      -e 's/\b(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b/<ip>/g' \
+      "$f"
+  done
+  info "hostname, user name, MAC and IPv4 addresses replaced (serial numbers aren't collected)"
+  mkdir -p "$OUT_DIR"
+  out="$OUT_DIR/bc250-fixer-report-$stamp.tar.gz"
+  tar czf "$out" -C "$tmp" "bc250-fixer-report-$stamp" || die "couldn't write $out"
+  rm -rf "$tmp"
+  [[ -n ${SUDO_USER:-} ]] && chown "$SUDO_USER": "$out" 2>/dev/null
+  ok "support bundle: $out"
+  info "contains: check, memory split, compute units, system details, kernel logs (this and last boot)"
+  info "look through it before posting: tar xzf $(basename "$out") && less bc250-fixer-report-$stamp/*"
+}
+
+# =====================================================================================
+# install / uninstall
+# =====================================================================================
+cmd_install() {
+  need_root install
+  act install -D -m 0755 "$SELF" "$INSTALL_PATH" && did "installed: $INSTALL_PATH (run: sudo bc250-fixer help)"
+}
+cmd_uninstall() {
+  need_root uninstall
+  if [[ -f $SYSTEMD_DIR/$GUARD_UNIT ]] && [[ $FORCE != 1 ]]; then
+    die "the CU boot unlock uses this tool at boot; run 'sudo bc250-fixer cu unpersist' first (or --force)"
+  fi
+  act rm -f "$INSTALL_PATH" && did "removed $INSTALL_PATH"
+  if [[ ${1:-} == purge ]]; then
+    act rm -rf "$TOOLS" "$STATE" && did "removed $TOOLS and $STATE (test results, logs, CMOS backups)"
+  else
+    info "kept $TOOLS (community tools) and $STATE (results, logs, CMOS backups); 'bc250-fixer uninstall purge' removes them"
+  fi
+}
+
+# =====================================================================================
+# main
+# =====================================================================================
+# with_report NAME CMD...: run, and also save the output (without colours) under OUT_DIR
+with_report() {
+  local name="$1" f raw rc; shift
+  mkdir -p "$OUT_DIR" 2>/dev/null || OUT_DIR=/tmp
+  f="$OUT_DIR/bc250-fixer-$name-$(date +%Y%m%d-%H%M%S).txt"; raw=$(mktemp)
+  "$@" 2>&1 | tee "$raw"; rc=${PIPESTATUS[0]}
+  strip_color <"$raw" >"$f"; rm -f "$raw"
+  [[ -n ${SUDO_USER:-} ]] && chown "$SUDO_USER": "$f" 2>/dev/null
+  printf '\nSaved to: %s\n' "$f"
+  return "$rc"
+}
+
+CMD="${1:-help}"; shift || true
+case $CMD in
+  check)     with_report check cmd_check "$@" ;;
+  fix)       cmd_fix "$@" ;;
+  vram)      with_report "vram-${1:-check}" cmd_vram "$@" ;;
+  headless)  cmd_headless "$@" ;;
+  cu)        cmd_cu "$@" ;;
+  cpu)       cmd_cpu "$@" ;;
+  soak)      cmd_soak "$@" ;;
+  monitor)   cmd_monitor ;;
+  llama)     cmd_llama "$@" ;;
+  report)    cmd_report ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall "$@" ;;
+  version)   echo "bc250-fixer $VERSION" ;;
+  help)      sed -n '2,/^$/s/^# \{0,1\}//p' "$SELF" ;;
+  *)         die "unknown command '$CMD' (try: bc250-fixer help)" ;;
+esac
