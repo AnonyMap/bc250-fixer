@@ -15,6 +15,12 @@
 #        bench            Ollama reading/writing speed: stock vs unlocked
 #        persist | unpersist   apply at every boot (with a crash-loop guard) / stop
 #   cpu unlock | test [SECONDS]   the 2 disabled CPU cores (6 -> 8), and a verified stress test
+#   gov <command>         the GPU clock governor (cyan-skillfish-governor-smu):
+#        status | install install, configure and start it (capped at 1500 MHz to begin with)
+#        safe | limit MHZ cap the clock at 1500 MHz / at MHZ
+#        tune             step the clock up, testing each step, and recommend a stable limit
+#        undervolt [MHZ]  step the voltage down at one curve point (default 1500) to cut heat
+#        restore          put back the config from before this tool's first change
 #   soak [MINUTES]        stability soak at the current settings (GPU correctness, heat, kernel log)
 #   monitor               live clocks, temperatures, power and memory (Ctrl-C to stop)
 #   llama build | bench MODEL.gguf   build llama.cpp with Vulkan; benchmark a model
@@ -28,13 +34,14 @@
 # Command flags:
 #   --passes N --rounds N --soak-minutes N --temp-limit C --model NAME   (cu test, soak, bench)
 #   --size GB (fix swap)  --interval S --count N --log FILE.csv (monitor)  --llama-dir DIR
+#   --from MHZ --to MHZ --step MHZ --step-seconds S --min-mv MV --ollama-load --retest-frozen   (gov tune, undervolt)
 #
 # Run as root (sudo) except for help, monitor and llama build/bench.
 # Changes that need a reboot say so. Every file it edits is backed up next to itself as *.bc250-fixer.bak.
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/sbin/bc250-fixer}"
 
@@ -54,6 +61,13 @@ MONLOG="${MONLOG:-}"
 OUT_DIR="${OUT_DIR:-$PWD}"
 LLAMA_DIR="${LLAMA_DIR:-}"
 FORCE="${FORCE:-0}"
+FROM_MHZ="${FROM_MHZ:-1500}"
+TO_MHZ="${TO_MHZ:-2000}"
+STEP_MHZ="${STEP_MHZ:-50}"
+STEP_SECONDS="${STEP_SECONDS:-120}"
+MIN_MV="${MIN_MV:-}"
+OLLAMA_LOAD="${OLLAMA_LOAD:-0}"
+RETEST_FROZEN="${RETEST_FROZEN:-0}"
 YES=0 DRY=0 NOCOLOR=0
 
 STATE="${STATE:-/var/lib/bc250-fixer}"
@@ -79,12 +93,19 @@ while (( $# )); do
   _eq=0
   if [[ $1 == --*=* ]]; then set -- "${1%%=*}" "${1#*=}" "${@:2}"; _eq=1; fi
   case $1 in
-    -y|--yes|-n|--dry-run|--force|--no-color)
+    -y|--yes|-n|--dry-run|--force|--no-color|--ollama-load|--retest-frozen)
       (( _eq == 0 )) || { echo "$1 doesn't take a value (use it on its own)" >&2; exit 2; } ;;&
     -y|--yes) YES=1 ;;
     -n|--dry-run) DRY=1 ;;
     --force) FORCE=1 ;;
     --no-color) NOCOLOR=1 ;;
+    --ollama-load) OLLAMA_LOAD=1 ;;
+    --retest-frozen) RETEST_FROZEN=1 ;;
+    --from) need_val "$@"; FROM_MHZ="$2"; shift ;;
+    --to) need_val "$@"; TO_MHZ="$2"; shift ;;
+    --step) need_val "$@"; STEP_MHZ="$2"; shift ;;
+    --step-seconds) need_val "$@"; STEP_SECONDS="$2"; shift ;;
+    --min-mv) need_val "$@"; MIN_MV="$2"; shift ;;
     --out) need_val "$@"; OUT_DIR="$2"; shift ;;
     --passes) need_val "$@"; PASSES="$2"; shift ;;
     --rounds) need_val "$@"; ROUNDS="$2"; shift ;;
@@ -106,10 +127,11 @@ while (( $# )); do
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
-for _v in PASSES ROUNDS SOAK_MINUTES TEMP_LIMIT BENCH_RUNS BENCH_LINES VERIFY_TIMEOUT SWAP_GB INTERVAL; do
+for _v in PASSES ROUNDS SOAK_MINUTES TEMP_LIMIT BENCH_RUNS BENCH_LINES VERIFY_TIMEOUT SWAP_GB INTERVAL FROM_MHZ TO_MHZ STEP_MHZ STEP_SECONDS; do
   [[ ${!_v} =~ ^[0-9]+$ && ${!_v} -gt 0 ]] || { echo "$_v must be a whole number above 0 (got '${!_v}')" >&2; exit 2; }
 done
 [[ $COUNT =~ ^[0-9]+$ ]] || { echo "--count must be a whole number" >&2; exit 2; }
+[[ -z $MIN_MV || $MIN_MV =~ ^[0-9]+$ ]] || { echo "--min-mv must be a whole number of mV" >&2; exit 2; }
 SOAK_SECONDS="${SOAK_SECONDS:-$(( SOAK_MINUTES * 60 ))}"
 
 # ---------- output ----------
@@ -142,10 +164,25 @@ act() { if (( DRY )); then printf '  %s[dry-run]%s %s\n' "$Y" "$N" "$*"; else "$
 backup() { [[ -f $1 && ! -f $1.bc250-fixer.bak ]] && act cp -p "$1" "$1.bc250-fixer.bak"; return 0; }
 # write_file FILE (content on stdin): back up, then replace
 write_file() {
-  local f="$1" content; content="$(cat)"
-  [[ -n $content ]] || { fail "refusing to write an empty $f"; return 1; }
-  if (( DRY )); then printf '  %s[dry-run]%s would write %s:\n' "$Y" "$N" "$f"; printf '%s\n' "$content" | sed 's/^/      | /'; return 0; fi
-  backup "$f"; mkdir -p "$(dirname "$f")"; printf '%s\n' "$content" >"$f"
+  local f="$1" content; content="$(cat; printf x)"; content=${content%x}   # byte-exact, trailing newlines kept
+  [[ -n ${content//[$'\n\t ']/} ]] || { fail "refusing to write an empty $f"; return 1; }
+  if (( DRY )); then
+    if [[ -f $f ]] && have diff; then
+      printf '  %s[dry-run]%s would change %s:\n' "$Y" "$N" "$f"
+      diff -u "$f" <(printf '%s' "$content") | tail -n +3 | sed 's/^/      | /'
+    else
+      printf '  %s[dry-run]%s would write %s:\n' "$Y" "$N" "$f"; printf '%s' "$content" | sed 's/^/      | /'
+    fi
+    return 0
+  fi
+  backup "$f"; mkdir -p "$(dirname "$f")"
+  local tmp; tmp=$(mktemp "$(dirname "$f")/.$(basename "$f").XXXXXX") || return 1
+  printf '%s' "$content" >"$tmp" || { rm -f "$tmp"; return 1; }
+  if [[ -e $f ]]; then chmod --reference="$f" "$tmp" 2>/dev/null; chown --reference="$f" "$tmp" 2>/dev/null
+  else chmod 644 "$tmp"; fi
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }   # atomic: a crash leaves the old file or the new one
+  have restorecon && restorecon -q "$f" 2>/dev/null
+  return 0
 }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "this needs root: sudo bc250-fixer ${*:-$CMD}"; }
 no_dry() { (( DRY == 0 )) || die "'$*' can't run as a dry run: it only makes sense for real"; }
@@ -314,7 +351,7 @@ cmd_check() {
 
   # ---------------------------------------------------------------- governor
   section "GPU clock governor & compute units"
-  local GOV_ACTIVE="" GOV_MAXF=0 svc INST cfg PAIRS MINMV TOP CUS CC CU40=0
+  local GOV_ACTIVE="" GOV_MAXF=0 GCAP="" svc INST cfg PAIRS MINMV TOP CUS CC CU40=0
   for svc in cyan-skillfish-governor-smu cyan-skillfish-governor oberon-governor; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then GOV_ACTIVE=$svc; break; fi
   done
@@ -322,20 +359,29 @@ cmd_check() {
   else
     INST=$(systemctl list-unit-files 2>/dev/null | grep -oE '(cyan-skillfish-governor(-smu)?|oberon-governor)\.service' | head -1)
     if [ -n "$INST" ]; then fail "GPU governor installed ($INST) but NOT running. Check: journalctl -u ${INST%.service}"
-    else fail "No GPU governor installed. Install cyan-skillfish-governor-smu: it is the only working clock/voltage control on this GPU."; fi
+    else fail "No GPU governor installed. It is the only working clock/voltage control on this GPU: sudo bc250-fixer gov install"; fi
   fi
-  for cfg in /etc/cyan-skillfish-governor-smu/config.toml /etc/cyan-skillfish-governor/config.toml; do
+  for cfg in "$GOV_CFG" /etc/cyan-skillfish-governor/config.toml; do
     [ -r "$cfg" ] || continue
     info "Config: $cfg"
-    awk '/^\[frequency-range\]/{f=1;next} /^\[/{f=0} f' "$cfg" | grep -qi 'mhz' && \
+    awk '/^\[frequency-range\]/{f=1;next} /^\[/{f=0} f' "$cfg" | sed 's/#.*//' | grep -qi 'mhz' && \
       fail "'MHz' suffix inside [frequency-range] in $cfg: this breaks the parser. Use bare numbers."
     PAIRS=$(grep -oE '\[ *[0-9]{3,4} *, *[0-9]{3,4} *\]' "$cfg" | tr -d '[] ')
+    if [ "$cfg" = "$GOV_CFG" ] && gov_info && [ -n "$G_POINTS" ]; then   # current [[safe-points]] format
+      PAIRS=$(tr ' :' '\n,' <<<"$G_POINTS")
+      GCAP=$(gov_cap)
+      info "Clock limit in the config: ${G_MAX:-0} MHz (0 = none); D-Bus control: $([ "$G_DBUS" = 1 ] && echo on || echo off)"
+      [ "$GCAP" -gt 1500 ] && warn "The governor can reach $GCAP MHz, above the 1500 MHz baseline. Find what's stable: sudo bc250-fixer gov tune (or cap it: sudo bc250-fixer gov safe)"
+    elif [ "$cfg" = "$GOV_CFG" ] && [ -n "${GOV_ERR:-}" ]; then
+      fail "The governor config can't be read: $GOV_ERR"
+    fi
     if [ -n "$PAIRS" ]; then
       MINMV=$(cut -d, -f2 <<<"$PAIRS" | sort -n | head -1)
       TOP=$(sort -t, -k1,1n <<<"$PAIRS" | tail -1); GOV_MAXF=${TOP%,*}
       if [ "$MINMV" -lt 700 ]; then fail "A governor voltage point is ${MINMV} mV: below 700 mV locks the GPU to 1500 MHz"
       else pass "Lowest governor voltage point: ${MINMV} mV"; fi
-      info "Highest point: ${GOV_MAXF} MHz @ ${TOP#*,} mV  (stable baseline: 1500 MHz @ 900 mV)"
+      info "Highest point on the curve: ${GOV_MAXF} MHz @ ${TOP#*,} mV  (stable baseline: 1500 MHz @ 900 mV)"
+      [ -n "${GCAP:-}" ] && GOV_MAXF=$GCAP   # the config's limit, not just the curve's top
     fi
   done
   [ -n "$CARD" ] && [ -r "$CARD/pp_dpm_sclk" ] && info "Current GPU clock: $(grep '\*' "$CARD/pp_dpm_sclk" | awk '{print $2}')"
@@ -401,7 +447,7 @@ cmd_check() {
   done
   if [ "$T_HANG" -gt 0 ]; then
     MSG="GPU hangs logged ($T_HANG events). Usual cause: voltage too low for the clock."
-    [ "$GOV_MAXF" -gt 1500 ] && MSG+=" Your governor goes up to ${GOV_MAXF} MHz: cap it at 1500 MHz @ 900 mV and retest."
+    [ "$GOV_MAXF" -gt 1500 ] && MSG+=" Your governor goes up to ${GOV_MAXF} MHz: cap it at 1500 MHz (sudo bc250-fixer gov safe) and retest, or find your stable limit with 'gov tune'."
     [ "$CU40" = 1 ] && MSG+=" 40 CUs are unlocked: revert to 24 until stable."
     MSG+=" If hangs come only after long runs, add heatsinks to the back-side GDDR6 chips."
     fail "$MSG"
@@ -1279,12 +1325,13 @@ WATCH_PID=""
 watch_start() {   # track max GPU temp; above TEMP_LIMIT drop to stock routing at once
   mkdir -p "$RUN"; echo 0 >"$RUN/maxtemp"; rm -f "$RUN/hot"
   [[ -n $GPU_TEMP ]] || return 0
-  local can_revert=0 me=$$; [[ -f $LM ]] && can_revert=1
+  local me=$$ hot_cmd="${HOT_CMD:-}"
+  [[ -z $hot_cmd && -f $LM ]] && hot_cmd="$LM --yes stock-dispatch"   # cu: drop to stock CUs
   ( while kill -0 "$me" 2>/dev/null; do   # stops by itself if this tool exits
       t=$(( $(cat "$GPU_TEMP" 2>/dev/null || echo 0) / 1000 ))
       (( t > $(cat "$RUN/maxtemp" 2>/dev/null || echo 0) )) && { echo "$t" >"$RUN/maxtemp.new"; mv -f "$RUN/maxtemp.new" "$RUN/maxtemp"; }
       if (( t >= TEMP_LIMIT )) && [[ ! -e $RUN/hot ]]; then
-        touch "$RUN/hot"; (( can_revert )) && "$LM" --yes stock-dispatch >>"$LOG" 2>&1
+        touch "$RUN/hot"; [[ -n $hot_cmd ]] && bash -c "$hot_cmd" >>"$LOG" 2>&1
       fi
       sleep 1
     done ) >/dev/null 2>&1 &
@@ -1373,7 +1420,8 @@ cu_cleanup() {
   (( GY_PAUSED )) && { gy resume || warn "couldn't resume gpu-yield; run: gpu-yield resume"; }
 }
 
-governor_cap() {   # highest clock in the GPU governor's config, in MHz (0 if unknown)
+governor_cap() {   # highest clock the GPU governor allows, in MHz (0 if unknown)
+  if gov_info 2>/dev/null && [[ -n $G_POINTS || $G_MAX -gt 0 ]]; then gov_cap; return; fi
   local f max=0 v
   for f in /etc/cyan-skillfish-governor-smu/config.toml /etc/cyan-skillfish-governor/config.toml; do
     [[ -r $f ]] || continue
@@ -1450,7 +1498,7 @@ soak_run() {
   elif [[ -n $errs ]]; then SOAK_RES=FAIL SOAK_DETAIL="GPU error: $(head -n1 <<<"$errs")"
   elif (( rc == 2 )); then SOAK_RES=FAIL SOAK_DETAIL="wrong results under sustained load"
   elif (( rc != 0 )); then SOAK_RES=FAIL SOAK_DETAIL="verifier error or hang (exit $rc)"
-  else SOAK_RES=PASS SOAK_DETAIL="$n verifier runs over $(( (SOAK_SECONDS + 59) / 60 )) min, all correct"; fi
+  else SOAK_RES=PASS SOAK_DETAIL="$n verifier runs over $(gov_dur "$SOAK_SECONDS"), all correct"; fi
   record "$label" "$SOAK_RES" "$(max_temp)" "$SOAK_DETAIL"
   rm -f "$INPROG"
 }
@@ -1846,6 +1894,533 @@ cmd_cpu() {
 }
 
 # =====================================================================================
+# gov: the GPU clock governor and a clock tuner
+# cyan-skillfish-governor-smu (github.com/filippor/cyan-skillfish-governor, smu branch) is
+# the only working clock/voltage control on this GPU. It picks a clock from the GPU load and
+# a voltage from the [[safe-points]] curve in its config. Its root-only D-Bus call
+# TestMode.SetTestMode(MHz, mV) pins one clock and voltage; restarting the service ends it.
+# The tuner uses that to step through clocks (voltages from your own curve) and checks each
+# one the way 'cu test' checks CU pairs: GPU results against the CPU, the kernel log,
+# hangs and temperature, with crash attribution if the board freezes.
+# =====================================================================================
+GOV_SVC="cyan-skillfish-governor-smu"
+GOV_CFG="${GOV_CFG:-/etc/cyan-skillfish-governor-smu/config.toml}"
+GOV_STATE="$STATE/gov"
+GOV_BUS_NAME="com.cyanskillfish.Governor"
+GOV_BUS_PATH="/com/cyanskillfish/Governor"
+GOV_TAG="${GOV_TAG:-v0.4.9}"   # pinned release (only for distros without a COPR/AUR package)
+GOV_API="https://api.github.com/repos/filippor/cyan-skillfish-governor/releases/tags/$GOV_TAG"
+GOV_COPR="filippor/bazzite"
+SAFE_MHZ=1500          # the community's stable baseline (1500 MHz @ 900 mV)
+MAX_TUNE_MV=1050       # the tuner never asks for more without --force
+MAX_TUNE_MHZ=2400
+
+GOVCFG_PY=$(cat <<'PY'
+import re, sys
+try:
+    import tomllib
+except ImportError:
+    sys.exit("ERROR=python 3.11+ (tomllib) is needed to read the governor config")
+mode, path, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+text = open(path, encoding="utf-8").read()
+
+def points(cfg):
+    pts = []
+    for p in cfg.get("safe-points", []) or []:
+        if isinstance(p, dict):
+            pts.append((int(p["frequency"]), int(p["voltage"])))
+        elif isinstance(p, (list, tuple)) and len(p) == 2:
+            pts.append((int(p[0]), int(p[1])))
+    return sorted(pts)
+
+def interp(pts, f):   # exactly as the governor's voltage_for_freq: integer, rounded down
+    if not pts or f > pts[-1][0] or f < pts[0][0]:
+        return None
+    for (f0, v0), (f1, v1) in zip(pts, pts[1:]):
+        if f == f0:
+            return v0
+        if f0 < f <= f1:
+            return v0 + (v1 - v0) * (f - f0) // (f1 - f0)
+    return pts[-1][1] if f == pts[-1][0] else None
+
+def check_curve(pts):
+    for (f0, v0), (f1, v1) in zip(pts, pts[1:]):
+        if v1 < v0:
+            sys.exit(f"ERROR=the curve would have {v1} mV at {f1} MHz, below {v0} mV at {f0} MHz; "
+                     "voltage must not drop as the clock rises")
+
+try:
+    cfg = tomllib.loads(text)
+except Exception as e:
+    sys.exit(f"ERROR=the config isn't valid TOML: {e}")
+
+if mode == "get":
+    pts = points(cfg)
+    fr = cfg.get("frequency-range", {}) or {}
+    print("POINTS=" + " ".join(f"{f}:{v}" for f, v in pts))
+    print(f"MIN={int(fr.get('min', 0) or 0)}")
+    print(f"MAX={int(fr.get('max', 0) or 0)}")
+    print(f"DBUS={int(bool((cfg.get('dbus', {}) or {}).get('enabled', False)))}")
+    print(f"THROTTLE={(cfg.get('temperature', {}) or {}).get('throttling', 85)}")
+    print(f"METHOD={(cfg.get('gpu', {}) or {}).get('set-method', 'smu')}")
+    sys.exit(0)
+if mode == "interp":
+    v = interp(points(cfg), int(args[0]))
+    print("" if v is None else v)
+    sys.exit(0 if v is not None else 3)
+if mode == "neighbours":   # neighbours F V: the clocks between F and the points either side, and
+    f, v = int(args[0]), int(args[1])   # their voltages once F's point is set to V
+    pts = points(cfg)
+    if f not in dict(pts):
+        sys.exit(f"ERROR={f} MHz isn't a point on the curve")
+    new = sorted({**dict(pts), f: v}.items())
+    check_curve(new)
+    fs = [p[0] for p in new]; i = fs.index(f)
+    for j in (i - 1, i + 1):
+        if 0 <= j < len(fs):
+            mid = (fs[j] + f) // 2
+            print(f"{mid}:{interp(new, mid)}")
+    sys.exit(0)
+
+# ---- edits: line-based, so comments and layout survive; the result is re-parsed ----
+lines = text.split("\n")
+HDR = re.compile(r"^\s*\[\s*([A-Za-z0-9_.\-]+)\s*\]\s*(#.*)?$")
+AHDR = re.compile(r"^\s*\[\[\s*([A-Za-z0-9_.\-]+)\s*\]\]\s*(#.*)?$")
+
+def sections():   # [(name, is_array, start, end)] where lines[start] is the header
+    out, cur = [], None
+    for i, l in enumerate(lines):
+        m, a = HDR.match(l), AHDR.match(l)
+        if m or a:
+            if cur: out.append(cur + (i,))
+            cur = ((a or m).group(1), bool(a), i)
+    if cur: out.append(cur + (len(lines),))
+    return out
+
+def set_key(table, key, value):
+    for name, arr, s, e in sections():
+        if name == table and not arr:
+            for i in range(s + 1, e):
+                if re.match(rf"^\s*{re.escape(key)}\s*=", lines[i]):
+                    c = re.search(r"\s+#.*$", lines[i])          # keep an inline comment
+                    lines[i] = f"{key} = {value}" + (c.group(0) if c else "")
+                    return
+            lines.insert(s + 1, f"{key} = {value}")
+            return
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.extend([f"[{table}]", f"{key} = {value}", ""])
+
+if mode == "set-max":
+    set_key("frequency-range", "max", int(args[0]))
+elif mode == "set-dbus":
+    set_key("dbus", "enabled", "true")
+elif mode == "set-point":
+    f, v = int(args[0]), int(args[1])
+    done = False
+    for name, arr, s, e in sections():
+        if name == "safe-points" and arr:
+            fi = next((i for i in range(s + 1, e) if re.match(r"^\s*frequency\s*=\s*" + str(f) + r"\b", lines[i])), None)
+            vi = next((i for i in range(s + 1, e) if re.match(r"^\s*voltage\s*=", lines[i])), None)
+            if fi is not None and vi is not None:
+                lines[vi] = f"voltage = {v}"
+                done = True
+                break
+    if not done:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(["[[safe-points]]", f"frequency = {f}", f"voltage = {v}", ""])
+else:
+    sys.exit(f"ERROR=unknown mode {mode}")
+
+out = "\n".join(lines)
+try:
+    new = tomllib.loads(out)
+except Exception as e:
+    sys.exit(f"ERROR=the edit produced invalid TOML ({e}); nothing written")
+check_curve(points(new))
+if mode == "set-max" and int((new.get("frequency-range") or {}).get("max", -1)) != int(args[0]):
+    sys.exit("ERROR=the new limit didn't read back")
+if mode == "set-point" and dict(points(new)).get(int(args[0])) != int(args[1]):
+    sys.exit("ERROR=the new point didn't read back")
+sys.stdout.write(out)
+PY
+)
+
+# gov_info: reads the config into G_POINTS ("MHz:mV ..."), G_MIN, G_MAX, G_DBUS, G_THROTTLE, G_METHOD
+gov_info() {
+  local k v err=""
+  G_POINTS="" G_MIN=0 G_MAX=0 G_DBUS=0 G_THROTTLE="" G_METHOD=""
+  [[ -r $GOV_CFG ]] || return 1
+  have python3 || return 1
+  while IFS='=' read -r k v; do
+    case $k in
+      POINTS) G_POINTS=$v ;; MIN) G_MIN=$v ;; MAX) G_MAX=$v ;; DBUS) G_DBUS=$v ;;
+      THROTTLE) G_THROTTLE=$v ;; METHOD) G_METHOD=$v ;; ERROR) err=$v ;;
+    esac
+  done < <(python3 -c "$GOVCFG_PY" get "$GOV_CFG" 2>&1)
+  [[ -z $err ]] || { GOV_ERR=$err; return 1; }
+}
+gov_top_point() { local p last=""; for p in $G_POINTS; do last=$p; done; echo "${last%%:*}"; }
+gov_cap() {   # effective highest clock: the config's max, bounded by the top of the curve
+  local top; top=$(gov_top_point)
+  if (( G_MAX > 0 && ${top:-0} > 0 )); then echo $(( G_MAX < top ? G_MAX : top ))
+  elif (( G_MAX > 0 )); then echo "$G_MAX"
+  else echo "${top:-0}"; fi
+}
+gov_interp() { python3 -c "$GOVCFG_PY" interp "$GOV_CFG" "$1" 2>/dev/null; }
+gov_installed() { have cyan-skillfish-governor-smu || [[ -x /etc/cyan-skillfish-governor-smu/cyan-skillfish-governor-smu ]] || systemctl cat "$GOV_SVC" >/dev/null 2>&1; }
+gov_active() { systemctl is-active -q "$GOV_SVC" 2>/dev/null; }
+gov_on_bus() {
+  busctl --system call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus NameHasOwner s "$GOV_BUS_NAME" 2>/dev/null | grep -q true
+}
+gov_test_mode() { busctl --system call "$GOV_BUS_NAME" "$GOV_BUS_PATH" "$GOV_BUS_NAME.TestMode" SetTestMode uu "$1" "$2" >>"$LOG" 2>&1; }
+gov_reset() { systemctl restart "$GOV_SVC" >>"$LOG" 2>&1; }   # ends test mode and reloads the config
+gov_dur() { if (( $1 < 120 )); then echo "${1}s"; else echo "$(( ($1 + 59) / 60 )) min"; fi; }
+gov_clock() { local c; c=$(gpu_card) && grep '\*' "$c/pp_dpm_sclk" 2>/dev/null | grep -oE '[0-9]+' | tail -n1; }
+
+# gov_edit MODE ARGS...: edit the config (backed up first), then restart the governor
+gov_edit() {
+  local tmp err
+  tmp=$(mktemp)
+  if ! err=$(python3 -c "$GOVCFG_PY" "$@" 2>&1 >"$tmp"); then :; fi
+  if [[ ! -s $tmp || $err == ERROR=* ]]; then rm -f "$tmp"; fail "couldn't change the governor config: ${err#ERROR=}"; return 1; fi
+  write_file "$GOV_CFG" <"$tmp" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  if gov_active || (( DRY )); then act systemctl restart "$GOV_SVC" || { fail "the governor didn't restart; check: journalctl -u $GOV_SVC -n 30"; return 1; }; fi
+}
+gov_set_max() {
+  local mhz="$1" top
+  [[ $mhz =~ ^[0-9]+$ ]] && (( mhz >= 500 && mhz <= MAX_TUNE_MHZ )) || die "the clock limit must be 500-$MAX_TUNE_MHZ MHz (got '$mhz')"
+  gov_info || die "couldn't read $GOV_CFG${GOV_ERR:+: $GOV_ERR}"
+  top=$(gov_top_point)
+  (( ${top:-0} == 0 || mhz <= top )) || die "$mhz MHz is above the top of your voltage curve ($top MHz); the governor can't go there. Add a safe point first."
+  gov_edit set-max "$GOV_CFG" "$mhz" || return 1
+  did "governor limited to $mhz MHz"
+  (( mhz > SAFE_MHZ )) && warn "above the community's $SAFE_MHZ MHz baseline: more heat, especially with extra CUs. Keep an eye on 'bc250-fixer monitor'."
+  return 0
+}
+
+gov_status() {
+  section "GPU clock governor"
+  if ! gov_installed; then
+    fail "not installed. It's the only working clock/voltage control on this GPU: sudo bc250-fixer gov install"; return
+  fi
+  if gov_active; then pass "$GOV_SVC is running"; else fail "$GOV_SVC is installed but not running: sudo systemctl start $GOV_SVC (log: journalctl -u $GOV_SVC)"; fi
+  info "starts at boot: $(systemctl is-enabled "$GOV_SVC" 2>/dev/null || echo no)"
+  if ! gov_info; then warn "couldn't read $GOV_CFG${GOV_ERR:+: $GOV_ERR}"; return; fi
+  info "config: $GOV_CFG (set-method ${G_METHOD:-smu}, throttles at ${G_THROTTLE:-85} °C)"
+  local p line="" cap
+  for p in $G_POINTS; do line+="${p%%:*}@${p##*:} "; done
+  info "voltage curve (MHz@mV): ${line:-none, built-in defaults}"
+  cap=$(gov_cap)
+  info "clock range: ${G_MIN:-0}-${G_MAX:-0} MHz in the config (0 = no limit); effective top: ${cap} MHz"
+  if (( cap > SAFE_MHZ )); then warn "the governor can go to $cap MHz, above the $SAFE_MHZ MHz community baseline. Test what's stable first: sudo bc250-fixer gov tune"
+  else pass "clock capped at $cap MHz"; fi
+  if (( G_DBUS )); then pass "D-Bus control is on (the tuner needs it)"; else info "D-Bus control is off; 'gov tune' turns it on"; fi
+  local c; c=$(gov_clock); [[ -n $c ]] && info "current GPU clock (driver): $c MHz"
+  if [[ -s $GOV_STATE/results.tsv ]]; then
+    section "Tuning results"
+    awk -F'\t' '{ r[$1] = $2 "\t" $3 "\t" $4 "\t" $5 } END { for (w in r) print w "\t" r[w] }' "$GOV_STATE/results.tsv" | sort -t@ -k1,1n |
+      awk -F'\t' '{ printf "  %-14s %-5s max %3s °C  %s  (%s)\n", $1, $2, ($3 == "" ? "-" : $3), $4, $5 }'
+  fi
+}
+
+gov_install() {
+  need_root "gov install"
+  section "Installing $GOV_SVC"
+  if gov_installed; then ok "already installed"
+  else
+    case $(pkg_mgr) in
+      dnf)
+        act dnf -y copr enable "$GOV_COPR" || { pkg_install dnf-plugins-core; act dnf -y copr enable "$GOV_COPR"; } || die "couldn't enable the COPR repo $GOV_COPR"
+        act dnf install -y "$GOV_SVC" || die "dnf couldn't install $GOV_SVC" ;;
+      rpm-ostree)
+        local rel repo url
+        rel=$(rpm -E %fedora 2>/dev/null); [[ $rel =~ ^[0-9]+$ ]] || die "couldn't tell the Fedora release"
+        repo="/etc/yum.repos.d/_copr:copr.fedorainfracloud.org:filippor:bazzite.repo"
+        url="https://copr.fedorainfracloud.org/coprs/$GOV_COPR/repo/fedora-$rel/filippor-bazzite-fedora-$rel.repo"
+        local have_repo=0 rf
+        for rf in /etc/yum.repos.d/*.repo; do   # an existing repo file counts only if it's enabled
+          grep -qs 'filippor.bazzite' "$rf" && grep -qsE '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*1' "$rf" && have_repo=1
+        done
+        (( have_repo )) || act curl -fsSL -o "$repo" "$url" || die "couldn't fetch the COPR repo file ($url)"
+        act rpm-ostree install --idempotent "$GOV_SVC" || die "rpm-ostree couldn't install $GOV_SVC"
+        warn "layered with rpm-ostree: reboot, then run 'sudo bc250-fixer gov install' again to configure and start it"
+        return 0 ;;
+      pacman)
+        local helper=""; have paru && helper=paru; [[ -z $helper ]] && have yay && helper=yay
+        [[ -n $helper && -n ${SUDO_USER:-} ]] || die "it's in the AUR (cyan-skillfish-governor-smu). Install it with an AUR helper as your user, e.g.: paru -S cyan-skillfish-governor-smu"
+        act runuser -u "$SUDO_USER" -- "$helper" -S --needed "$GOV_SVC" || die "$helper couldn't install $GOV_SVC" ;;
+      *)
+        # Debian/Ubuntu: the release .deb; anything else: the release tarball (sha256 checked)
+        local json tmp asset sum
+        json=$(curl -fsSL "$GOV_API") || die "couldn't fetch release $GOV_TAG from GitHub"
+        tmp=$(mktemp -d)
+        if [[ $(pkg_mgr) == apt ]]; then
+          asset=$(python3 -c 'import json,sys; a=[x["browser_download_url"] for x in json.load(sys.stdin)["assets"] if x["name"].endswith("_amd64.deb")]; print(a[0] if a else "")' <<<"$json")
+          [[ -n $asset ]] || die "release $GOV_TAG has no amd64 .deb"
+          warn "the .deb comes from the governor author's $GOV_TAG release; GitHub publishes no checksum for it"
+          info "downloading $(basename "$asset")"
+          act curl -fsSL -o "$tmp/gov.deb" "$asset" || die "download failed"
+          act apt-get install -y "$tmp/gov.deb" || die "apt couldn't install the .deb"
+        else
+          asset=$(python3 -c 'import json,sys; a=[x["browser_download_url"] for x in json.load(sys.stdin)["assets"] if x["name"].endswith("x86_64-linux.tar.gz")]; print(a[0] if a else "")' <<<"$json")
+          [[ -n $asset ]] || die "release $GOV_TAG has no x86_64 tarball"
+          act curl -fsSL -o "$tmp/gov.tar.gz" "$asset" && act curl -fsSL -o "$tmp/gov.tar.gz.sha256" "$asset.sha256" || die "download failed"
+          if (( ! DRY )); then
+            sum=$(awk '{print $1}' "$tmp/gov.tar.gz.sha256")
+            [[ "$(sha256sum "$tmp/gov.tar.gz" | awk '{print $1}')" == "$sum" ]] || die "checksum mismatch on the governor download"
+            tar xzf "$tmp/gov.tar.gz" -C "$tmp" || die "couldn't unpack it"
+            ( cd "$tmp"/cyan-skillfish-governor-smu-*/ && ./install.sh ) || die "the governor's install.sh failed"
+          fi
+        fi
+        rm -rf "$tmp" ;;
+    esac
+    (( DRY )) || gov_installed || die "the install finished but $GOV_SVC still isn't there"
+    did "installed"
+  fi
+  [[ -r $GOV_CFG ]] || { (( DRY )) && return 0; die "no config at $GOV_CFG after installing"; }
+  section "Configuring"
+  gov_info || die "couldn't read $GOV_CFG${GOV_ERR:+: $GOV_ERR}"
+  local cap; cap=$(gov_cap)
+  if (( cap > SAFE_MHZ )); then
+    info "the default config lets the GPU reach $cap MHz; the community's stable baseline is $SAFE_MHZ MHz @ 900 mV"
+    if ask "Limit it to $SAFE_MHZ MHz for now (raise it later with 'gov tune')?"; then gov_edit set-max "$GOV_CFG" "$SAFE_MHZ" && did "limited to $SAFE_MHZ MHz"; fi
+  else pass "clock capped at $cap MHz"; fi
+  gov_info
+  if (( ! G_DBUS )) && ask "Turn on its D-Bus control (needed by 'gov tune' and 'cyan-skillfish-performance-mode')?"; then gov_edit set-dbus "$GOV_CFG" && did "D-Bus control on"; fi
+  section "Starting"
+  if gov_active; then act systemctl restart "$GOV_SVC"; else act systemctl start "$GOV_SVC"; fi
+  (( DRY )) && return 0
+  sleep 3
+  if gov_active; then ok "$GOV_SVC is running"
+  else journalctl -u "$GOV_SVC" -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/       /'; die "$GOV_SVC didn't stay up (log above)"; fi
+  info "the governor's author suggests a few minutes of real GPU load before starting it at boot"
+  if ! systemctl is-enabled -q "$GOV_SVC" 2>/dev/null && ask "Start it at every boot now?"; then act systemctl enable -q "$GOV_SVC" && did "starts at boot"; fi
+  printf '\n  Next: sudo bc250-fixer gov tune   (find the highest clock that is stable on this board)\n'
+}
+
+# one tuning step: pin F MHz @ V mV and run the soak checks for STEP_SECONDS.
+# Sets SOAK_RES to PASS, FAIL (the clock/voltage isn't stable) or ERROR (the test itself broke).
+gov_step() {
+  local f="$1" v="$2" label="$3" actual inv0 inv1
+  cool_down
+  printf '  %-14s ' "$label"
+  echo "$label $(boot_id)" >"$INPROG"; sync   # before the switch: a freeze while switching counts too
+  inv0=$(systemctl show -p InvocationID --value "$GOV_SVC" 2>/dev/null)
+  if ! gov_test_mode "$f" "$v"; then
+    rm -f "$INPROG"; SOAK_RES=ERROR SOAK_DETAIL="the governor rejected the D-Bus test-mode call (log: $LOG)"
+    printf '%sERROR%s %s\n' "$R" "$N" "$SOAK_DETAIL"; return
+  fi
+  sleep 2
+  actual=$(gov_clock)
+  local SOAK_SECONDS=$STEP_SECONDS
+  soak_run "$label" >/dev/null
+  inv1=$(systemctl show -p InvocationID --value "$GOV_SVC" 2>/dev/null)
+  if [[ $inv0 != "$inv1" && $SOAK_RES == PASS ]]; then
+    # the governor restarted mid-step (crash or Restart=), so the GPU left test mode: not a real pass
+    SOAK_RES=ERROR SOAK_DETAIL="the governor restarted during the step, so the test clock didn't hold"
+    record "$label" ERROR "$(max_temp)" "$SOAK_DETAIL"
+  fi
+  case $SOAK_RES in
+    PASS) local note=""
+          [[ -n $actual ]] && (( actual < f - 100 || actual > f + 100 )) && note="   (driver reports $actual MHz; its readout can be off on this chip)"
+          printf '%sPASS%s  max %s °C%s\n' "$G" "$N" "$(max_temp)" "$note" ;;
+    ERROR) printf '%sERROR%s %s\n' "$R" "$N" "$SOAK_DETAIL" ;;
+    *) printf '%sFAIL%s  %s\n' "$R" "$N" "$SOAK_DETAIL" ;;
+  esac
+}
+# results helpers: the latest result per label; frozen = the board froze during that step
+gov_frozen() { [[ -f $RESULTS ]] && awk -F'\t' '{ d[$1] = $4 } END { for (l in d) if (d[l] ~ /^board froze/) print l }' "$RESULTS"; }
+gov_frozen_min_f() { gov_frozen | grep -E '^[0-9]+@' | cut -d@ -f1 | sort -n | head -n1; }              # lowest clock that froze
+gov_frozen_max_v() { gov_frozen | grep -E "^uv:$1@" | cut -d@ -f2 | sort -n | tail -n1; }               # highest undervolt that froze at F
+gov_tune_prep() {   # shared checks for tune/undervolt
+  no_dry "gov $1"
+  need_root "gov $1"
+  is_bc250 || die "this isn't a BC-250 (no PCI device 1002:13fe). --force overrides, at your own risk."
+  have busctl || die "busctl (systemd) is needed to talk to the governor"
+  [[ -f $VERIFY ]] || die "the GPU verifier isn't installed; run: sudo bc250-fixer cu setup"
+  # in test mode the governor's own throttling is off, so this tool's temperature watch is the only guard
+  [[ -n $GPU_TEMP && -r $GPU_TEMP ]] || die "no readable GPU temperature sensor (amdgpu hwmon temp1_input): tuning without one is unsafe"
+  (( TEMP_LIMIT <= 95 )) || [[ $FORCE == 1 ]] || die "--temp-limit $TEMP_LIMIT is above 95 °C; the tuner refuses that without --force"
+  gov_installed || die "the governor isn't installed; run: sudo bc250-fixer gov install"
+  gov_info || die "couldn't read $GOV_CFG${GOV_ERR:+: $GOV_ERR}"
+  [[ -n $G_POINTS ]] || die "the governor config has no [[safe-points]] curve, so there are no voltages to test with"
+  if (( ! G_DBUS )); then
+    info "the tuner pins clocks through the governor's D-Bus control, which is off"
+    ask "Turn it on (restarts the governor)?" || die "can't tune without D-Bus control"
+    gov_edit set-dbus "$GOV_CFG" || exit 1
+  fi
+  gov_active || { systemctl start "$GOV_SVC"; sleep 3; }
+  gov_active || die "the governor isn't running; check: journalctl -u $GOV_SVC -n 30"
+  local t=0; until gov_on_bus || (( t >= 10 )); do sleep 1; t=$(( t + 1 )); done
+  gov_on_bus || die "the governor isn't answering on D-Bus ($GOV_BUS_NAME)"
+}
+gov_tune_begin() {
+  start_log "gov-$1"
+  mkdir -p "$GOV_STATE"
+  attribute_crash
+  HOT_CMD="systemctl restart $GOV_SVC"
+  trap 'gov_tune_cleanup' EXIT
+  trap 'exit 130' INT TERM HUP
+  if (( OLLAMA_LOAD )); then
+    ollama_up && info "keeping Ollama running as heat load (--ollama-load): requests during the test may hit an unstable clock"
+  elif [[ $(gy_state) == ai ]]; then
+    info "pausing gpu-yield, so no AI request runs at an untested clock (--ollama-load keeps it as heat load)"
+    gy pause && GY_PAUSED=1 || warn "couldn't pause gpu-yield"
+  elif ollama_up; then
+    warn "Ollama is running; requests during the test could hit an unstable clock"
+  fi
+  local cus="?"; if [[ -f $LM ]] && read_routing; then cus=$(cu_count "${CUR[@]}"); fi
+  info "testing at the current compute-unit setting: $cus CUs (more CUs = more heat at the same clock)"
+}
+gov_tune_cleanup() {
+  watch_stop
+  [[ -n $LOAD_PID ]] && { touch "$RUN/stop-load"; kill "$LOAD_PID" 2>/dev/null; wait "$LOAD_PID" 2>/dev/null; LOAD_PID=""; }
+  systemctl reset-failed "$GOV_SVC" >/dev/null 2>&1   # so a hit start limit can't block the restart
+  gov_reset || warn "couldn't restart the governor, so the GPU may still be held at a test clock: run sudo systemctl restart $GOV_SVC"
+  rm -f "$GOV_STATE/in-progress"   # explicit path: the trap may run after gov_tune's locals are gone
+  (( GY_PAUSED )) && { gy resume || warn "couldn't resume gpu-yield; run: gpu-yield resume"; }
+}
+
+gov_tune() {
+  gov_tune_prep tune
+  local RESULTS="$GOV_STATE/results.tsv" INPROG="$GOV_STATE/in-progress"
+  (( FROM_MHZ >= 500 && TO_MHZ <= MAX_TUNE_MHZ && FROM_MHZ < TO_MHZ && STEP_MHZ >= 10 )) ||
+    die "need 500 <= --from < --to <= $MAX_TUNE_MHZ and --step >= 10 (got $FROM_MHZ, $TO_MHZ, $STEP_MHZ)"
+  gov_tune_begin tune
+  local -a steps=() volts=()
+  local f v stop="" frozen
+  frozen=$(gov_frozen_min_f)
+  for (( f = FROM_MHZ; f <= TO_MHZ; f += STEP_MHZ )); do
+    if [[ -n $frozen ]] && (( f >= frozen && ! RETEST_FROZEN )); then
+      stop="the board froze at $frozen MHz in an earlier run, so nothing at or above it is tested (--retest-frozen tests it again)"; break
+    fi
+    v=$(gov_interp "$f") || { stop="$f MHz is outside your voltage curve ($(gov_top_point) MHz is its top); add [[safe-points]] to go further"; break; }
+    if (( v > MAX_TUNE_MV )) && [[ $FORCE != 1 ]]; then stop="$f MHz needs $v mV on your curve, above the tuner's $MAX_TUNE_MV mV limit (--force overrides)"; break; fi
+    steps+=("$f"); volts+=("$v")
+  done
+  (( ${#steps[@]} )) || die "nothing to test: ${stop:-check --from/--to}"
+  section "Plan"
+  info "clocks ${steps[0]}-${steps[-1]} MHz in $STEP_MHZ MHz steps, voltages from your curve; $(gov_dur "$STEP_SECONDS") each (up to ~$(gov_dur $(( ${#steps[@]} * (STEP_SECONDS + 30) ))) in all)"
+  info "a step fails on wrong GPU results, a GPU error in the kernel log, a hang, or $TEMP_LIMIT °C; the first failure ends the run"
+  [[ -n $stop ]] && info "stops at ${steps[-1]} MHz: $stop"
+  info "log: $LOG"
+  section "Tuning"
+  local i best="" bestv=""
+  for (( i = 0; i < ${#steps[@]}; i++ )); do
+    gov_step "${steps[i]}" "${volts[i]}" "${steps[i]}@${volts[i]}"
+    [[ $SOAK_RES == PASS ]] || break
+    best=${steps[i]} bestv=${volts[i]}
+  done
+  gov_reset
+  section "Result"
+  if [[ $SOAK_RES == ERROR ]]; then
+    fail "the run was stopped by a problem with the test itself, not the clock: $SOAK_DETAIL"
+    info "no recommendation from an incomplete run${best:+ (passed so far: up to $best MHz)}. Check: journalctl -u $GOV_SVC -n 30, then run gov tune again"
+    return 1
+  fi
+  if [[ -z $best ]]; then
+    fail "even ${steps[0]} MHz failed. Don't raise the clock: check cooling (including the back-side GDDR6) and the PSU, and run 'bc250-fixer soak'"
+    return 1
+  fi
+  local rec=$best limited=0
+  [[ $SOAK_RES != PASS || ( -n $frozen && $stop == *froze* ) ]] && limited=1
+  (( limited && best > steps[0] )) && rec=$(( best - STEP_MHZ ))
+  if (( ! limited )); then ok "every step passed, up to $best MHz @ $bestv mV"
+  elif [[ $SOAK_RES == PASS ]]; then ok "highest stable clock: $best MHz @ $bestv mV (the board froze at $frozen MHz before)"
+  else ok "highest stable clock: $best MHz @ $bestv mV"; fi
+  info "recommended limit: $rec MHz$( (( rec < best )) && echo ' (one step of margin below the highest pass)')"
+  info "these were $(gov_dur "$STEP_SECONDS") checks; run 'bc250-fixer soak' at the new limit before relying on it"
+  if ask "Set the governor's limit to $rec MHz?"; then gov_set_max "$rec"; fi
+}
+
+gov_undervolt() {
+  local f="${1:-$SAFE_MHZ}"
+  [[ $f =~ ^[0-9]+$ ]] || die "usage: bc250-fixer gov undervolt [MHZ] [--min-mv N]"
+  gov_tune_prep undervolt
+  local RESULTS="$GOV_STATE/results.tsv" INPROG="$GOV_STATE/in-progress"
+  local v0 floor v lowest="" label p pts_list=""
+  for p in $G_POINTS; do pts_list+="${p%%:*} "; done
+  # only existing points: a new point would change the voltage of every clock around it
+  [[ " $pts_list" == *" $f "* ]] || die "$f MHz isn't a point on your curve (points: ${pts_list% }). Undervolt one of those."
+  v0=$(gov_interp "$f") || die "couldn't read the voltage for $f MHz"
+  (( v0 <= MAX_TUNE_MV )) || [[ $FORCE == 1 ]] || die "$f MHz is at $v0 mV on your curve, above the tuner's $MAX_TUNE_MV mV limit (--force overrides)"
+  floor=${MIN_MV:-$(( v0 - 100 ))}
+  (( floor < 700 )) && floor=700   # below 700 mV this GPU drops to a fixed 1500 MHz
+  (( floor <= v0 - 10 )) || die "nothing to test: the floor ($floor mV) is within 10 mV of the curve's $v0 mV at $f MHz"
+  local -a volts=()
+  local fv; fv=$(gov_frozen_max_v "$f")
+  for (( v = v0 - 10; v >= floor; v -= 10 )); do
+    if [[ -n $fv ]] && (( v <= fv && ! RETEST_FROZEN )); then break; fi
+    volts+=("$v")
+  done
+  [[ -n $fv ]] && (( ! RETEST_FROZEN )) && warn "the board froze at $f MHz @ $fv mV in an earlier run; stopping above it (--retest-frozen tests it again)"
+  (( ${#volts[@]} )) || die "nothing left to test above the voltage that froze the board ($fv mV)"
+  gov_tune_begin undervolt
+  section "Plan"
+  info "$f MHz, from $v0 mV (your curve) down to ${volts[-1]} mV in 10 mV steps; $(gov_dur "$STEP_SECONDS") each"
+  info "lower voltage means less heat; too low gives wrong results or a hang, which ends the run"
+  info "log: $LOG"
+  section "Undervolting"
+  for v in "${volts[@]}"; do
+    gov_step "$f" "$v" "uv:$f@$v"
+    [[ $SOAK_RES == PASS ]] || break
+    lowest=$v
+  done
+  section "Result"
+  if [[ $SOAK_RES == ERROR ]]; then gov_reset; fail "stopped by a problem with the test itself: $SOAK_DETAIL. No recommendation."; return 1; fi
+  [[ -n $lowest ]] || { gov_reset; fail "even ${volts[0]} mV failed at $f MHz: keep the curve's $v0 mV"; return 1; }
+  local rec=$(( lowest + 20 )); (( rec > v0 )) && rec=$v0
+  ok "lowest stable voltage at $f MHz: $lowest mV"
+  info "recommended: $rec mV (20 mV of margin), down from $v0 mV"
+  (( rec < v0 )) || { gov_reset; info "no gain over your curve"; return 0; }
+  # changing one point also lowers the voltage of the clocks between it and its neighbours:
+  # test those too, at their new voltages, before writing anything
+  section "Checking the clocks next to $f MHz at their new voltages"
+  local nf nv ok_all=1 nbs
+  nbs=$(python3 -c "$GOVCFG_PY" neighbours "$GOV_CFG" "$f" "$rec" 2>&1) ||
+    { gov_reset; fail "can't use $rec mV at $f MHz: ${nbs#ERROR=}. The curve was left unchanged."; return 1; }
+  while IFS=: read -r nf nv; do
+    [[ -n $nf && -n $nv ]] || continue
+    gov_step "$nf" "$nv" "uvn:$nf@$nv"
+    [[ $SOAK_RES == PASS ]] || { ok_all=0; break; }
+  done < <(grep -E '^[0-9]+:[0-9]+$' <<<"$nbs")
+  gov_reset
+  if (( ! ok_all )); then
+    fail "a neighbouring clock wasn't stable at its lowered voltage ($nf MHz @ $nv mV). The curve was left unchanged."
+    return 1
+  fi
+  if ask "Set the $f MHz point of the governor's curve to $rec mV?"; then
+    gov_edit set-point "$GOV_CFG" "$f" "$rec" && did "$f MHz now runs at $rec mV"
+    info "the curve changed, so earlier 'gov tune' results no longer apply; run gov tune again to re-check higher clocks"
+  fi
+}
+
+gov_restore() {
+  need_root "gov restore"
+  [[ -f $GOV_CFG.bc250-fixer.bak ]] || die "no backup at $GOV_CFG.bc250-fixer.bak: this tool hasn't changed the governor config"
+  act cp -p "$GOV_CFG.bc250-fixer.bak" "$GOV_CFG" || die "couldn't restore the config"
+  if gov_active || (( DRY )); then act systemctl restart "$GOV_SVC"; fi
+  did "governor config restored from the backup taken before this tool's first change"
+}
+
+cmd_gov() {
+  local sub="${1:-status}"; shift || true
+  case $sub in
+    status) gov_status ;;
+    install) gov_install ;;
+    safe) need_root "gov safe"; gov_set_max "$SAFE_MHZ" ;;
+    limit) need_root "gov limit"; [[ -n ${1:-} ]] || die "usage: bc250-fixer gov limit MHZ"; gov_set_max "$1" ;;
+    tune) gov_tune ;;
+    undervolt) gov_undervolt "$@" ;;
+    restore) gov_restore ;;
+    *) die "usage: bc250-fixer gov status|install|safe|limit MHZ|tune|undervolt [MHZ]|restore" ;;
+  esac
+}
+
+# =====================================================================================
 # soak: stability soak at the current settings
 # =====================================================================================
 cmd_soak() {
@@ -2060,6 +2635,7 @@ case $CMD in
   headless)  cmd_headless "$@" ;;
   cu)        cmd_cu "$@" ;;
   cpu)       cmd_cpu "$@" ;;
+  gov)       cmd_gov "$@" ;;
   soak)      cmd_soak "$@" ;;
   monitor)   cmd_monitor ;;
   llama)     cmd_llama "$@" ;;
