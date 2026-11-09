@@ -1,0 +1,3 @@
+# reports and support bundles bc250-fixer saves in the current directory
+bc250-fixer-*.txt
+bc250-fixer-report-*.tar.gz
