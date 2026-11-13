@@ -78,6 +78,7 @@ main() {
   else say "installed: $new ($dest)"; fi
 
   case ":$PATH:" in *":$prefix:"*) ;; *) warn "$prefix isn't on this PATH; run it as $dest" ;; esac
+  [[ -e /run/ostree-booted ]] && say "rpm-ostree system: nothing gets layered; tools are built in a podman container and kept in /opt/bc250-fixer"
   if (( run_check )); then
     say "running a health check"
     "$dest" check || true
