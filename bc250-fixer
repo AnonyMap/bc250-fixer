@@ -21,6 +21,7 @@
 #        tune             step the clock up, testing each step, and recommend a stable limit
 #        undervolt [MHZ]  step the voltage down at one curve point (default 1500) to cut heat
 #        restore          put back the config from before this tool's first change
+#        uninstall        remove a governor that this tool installed from the release tarball
 #   soak [MINUTES]        stability soak at the current settings (GPU correctness, heat, kernel log)
 #   monitor               live clocks, temperatures, power and memory (Ctrl-C to stop)
 #   llama build | bench MODEL.gguf   build llama.cpp with Vulkan; benchmark a model
@@ -35,13 +36,17 @@
 #   --passes N --rounds N --soak-minutes N --temp-limit C --model NAME   (cu test, soak, bench)
 #   --size GB (fix swap)  --interval S --count N --log FILE.csv (monitor)  --llama-dir DIR
 #   --from MHZ --to MHZ --step MHZ --step-seconds S --min-mv MV --ollama-load --retest-frozen   (gov tune, undervolt)
+#   --deps local|packages   how cu setup, gov install and llama build get their tools. packages: the
+#                   package manager. local: nothing layered; tools built in a Fedora container
+#                   (podman) into /opt/bc250-fixer, the governor's release build into /usr/local.
+#                   Default: local on rpm-ostree (Bazzite, Fedora Atomic), packages elsewhere.
 #
 # Run as root (sudo) except for help, monitor and llama build/bench.
 # Changes that need a reboot say so. Every file it edits is backed up next to itself as *.bc250-fixer.bak.
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/sbin/bc250-fixer}"
 
@@ -68,6 +73,7 @@ STEP_SECONDS="${STEP_SECONDS:-120}"
 MIN_MV="${MIN_MV:-}"
 OLLAMA_LOAD="${OLLAMA_LOAD:-0}"
 RETEST_FROZEN="${RETEST_FROZEN:-0}"
+DEPS="${DEPS:-auto}"
 YES=0 DRY=0 NOCOLOR=0
 
 STATE="${STATE:-/var/lib/bc250-fixer}"
@@ -83,7 +89,8 @@ LM_COMMIT="a929085d791f126ce76a60eb609610820fb08066"
 DG_REPO="https://github.com/duggasco/bc250-40cu-unlock"
 DG_COMMIT="ae7c30c78e253a5e2c6af0e9c090f807b825191c"
 LM="${LM:-$TOOLS/live/bc250-cu-live-manager.sh}"
-VERIFY="${VERIFY:-$TOOLS/duggasco/scripts/bc250-compute-verify.sh}"
+VERIFY_SRC="$TOOLS/duggasco/scripts/bc250-compute-verify.sh"
+VERIFY="${VERIFY:-}"   # set after the flags: the script itself, or the prebuilt one (--deps local)
 CMOS_PORT="${CMOS_PORT:-/dev/port}"
 
 # ---------- argument parsing: global flags may appear anywhere ----------
@@ -117,6 +124,7 @@ while (( $# )); do
     --count) need_val "$@"; COUNT="$2"; shift ;;
     --log) need_val "$@"; MONLOG="$2"; shift ;;
     --llama-dir) need_val "$@"; LLAMA_DIR="$2"; shift ;;
+    --deps) need_val "$@"; DEPS="$2"; shift ;;
     -h|--help) ARGS+=(help) ;;
     -V|--version) ARGS+=(version) ;;
     --) shift; ARGS+=("$@"); break ;;
@@ -133,6 +141,7 @@ done
 [[ $COUNT =~ ^[0-9]+$ ]] || { echo "--count must be a whole number" >&2; exit 2; }
 [[ -z $MIN_MV || $MIN_MV =~ ^[0-9]+$ ]] || { echo "--min-mv must be a whole number of mV" >&2; exit 2; }
 SOAK_SECONDS="${SOAK_SECONDS:-$(( SOAK_MINUTES * 60 ))}"
+[[ $DEPS == @(auto|local|packages) ]] || { echo "--deps must be local or packages (got '$DEPS')" >&2; exit 2; }
 
 # ---------- output ----------
 if [[ -t 1 && $NOCOLOR == 0 ]]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' B=$'\e[1;36m' D=$'\e[2m' N=$'\e[0m'
@@ -232,6 +241,194 @@ pkg_install() {   # generic name list per manager; caller passes per-manager lis
     rpm-ostree) act rpm-ostree install --idempotent --allow-inactive "$@" && warn "rpm-ostree layered the packages: reboot before continuing" ;;
     *) die "no supported package manager (dnf, rpm-ostree, pacman, apt); install by hand: $*" ;;
   esac
+}
+
+# ---------- --deps local: tools built in a container, nothing layered ----------
+# On rpm-ostree systems (Bazzite, Fedora Atomic) /usr is read-only and packages have to be
+# layered, which takes a reboot and stays in every later update. /opt, /var, /etc and
+# /usr/local are writable there, so instead the tools are built in a Fedora container of the
+# same release (same glibc) and copied out to $TOOLS with the libraries they need:
+#   $TOOLS/native/     the compute verifier, compiled once instead of on every run
+#   $TOOLS/umr/        umr, its libraries and register database   ($TOOLS/bin has links)
+#   $TOOLS/stress-ng/  stress-ng (cpu test), $TOOLS/setpci/ setpci (cpu unlock), if missing
+# They stay root-owned in /opt rather than in a home folder: root runs them (and so does the
+# boot service), so a copy your own account can change would hand that account root, and
+# SELinux won't let a system service run programs from a home folder anyway.
+CTR="${CTR:-podman}"
+CTR_REV=1   # bump when the package list changes, so the image gets rebuilt
+CTR_PKGS="gcc glslang vulkan-headers vulkan-loader-devel umr stress-ng pciutils cmake gcc-c++ make git glslc spirv-headers-devel"
+CTR_TAG=""
+deps_local() {
+  case $DEPS in local) return 0 ;; packages) return 1 ;; *) [[ -e /run/ostree-booted ]] ;; esac
+}
+deps_why() { if [[ $DEPS == local ]]; then echo "--deps local"; else echo "rpm-ostree system, so nothing is layered; --deps packages layers them instead"; fi; }
+fedora_rel() {
+  local r="${FEDORA_RELEASE:-}"
+  [[ -n $r ]] || r=$(rpm -E %fedora 2>/dev/null)
+  [[ $r =~ ^[0-9]+$ ]] || r=$( . /etc/os-release 2>/dev/null; [[ " ${ID:-} ${ID_LIKE:-} " == *" fedora "* ]] && echo "${VERSION_ID%%.*}")
+  [[ $r =~ ^[0-9]+$ ]] && echo "$r"
+}
+ctr_check() {
+  have "$CTR" || die "--deps local needs podman (Bazzite and Fedora Atomic ship it). Or use --deps packages to install the packages instead."
+  fedora_rel >/dev/null || die "--deps local only works on Fedora-based systems: the tools are built in a Fedora container of the same release so they run on this system's glibc. Use --deps packages here (or set FEDORA_RELEASE=NN if this is Fedora-based and the release can't be detected)."
+}
+ctr_run() { "$CTR" run --rm --security-opt label=disable "$@"; }
+ctr_image() {   # build the tools image once per Fedora release (in root's or the user's podman store)
+  local rel ctx; rel=$(fedora_rel)
+  CTR_TAG="localhost/bc250-fixer-tools:f$rel-r$CTR_REV"
+  if "$CTR" image exists "$CTR_TAG" 2>/dev/null; then ok "tools image $CTR_TAG is already built"; return 0; fi
+  if (( DRY )); then printf '  %s[dry-run]%s would build %s from fedora:%s with: %s\n' "$Y" "$N" "$CTR_TAG" "$rel" "$CTR_PKGS"; return 0; fi
+  info "building $CTR_TAG from registry.fedoraproject.org/fedora:$rel"
+  info "(a few minutes; about 1.5 GB of podman storage under /var. The system itself isn't changed.)"
+  ctx=$(mktemp -d)
+  printf 'FROM registry.fedoraproject.org/fedora:%s\nRUN dnf -y install --setopt=install_weak_deps=False %s && dnf -y clean all\n' "$rel" "$CTR_PKGS" >"$ctx/Containerfile"
+  local rc
+  if [[ $LOG == /dev/null ]]; then "$CTR" build -t "$CTR_TAG" "$ctx" 2>&1 | sed -u 's/^/       | /'; rc=${PIPESTATUS[0]}   # no log file here: show it
+  else "$CTR" build -t "$CTR_TAG" "$ctx" >>"$LOG" 2>&1; rc=$?; (( rc )) && tail -n 8 "$LOG" | sed 's/^/       /'; fi
+  if (( rc )); then
+    rm -rf "$ctx"
+    fail "couldn't build the tools image$([[ $LOG != /dev/null ]] && echo " (log: $LOG)"). It needs to reach registry.fedoraproject.org and the Fedora mirrors."
+    return 1
+  fi
+  rm -rf "$ctx"; ok "built $CTR_TAG"
+  local old   # images for an older release (before a system upgrade) aren't needed any more
+  for old in $("$CTR" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep '^localhost/bc250-fixer-tools:' | grep -vxF "$CTR_TAG"); do
+    "$CTR" rmi "$old" >/dev/null 2>&1 && info "removed the old image $old"
+  done
+  return 0
+}
+CTR_SCRIPT=$(cat <<'SH'
+set -euo pipefail
+cd /out
+mkdir -p native
+glslangValidator -V src/bc250_compute_verify.comp -o native/bc250_compute_verify.spv >/dev/null
+gcc -std=c11 -O2 -Wall -Wextra -o native/bc250_compute_verify src/bc250_compute_verify.c -lvulkan -lm
+for n in "$@"; do   # each tool, plus every library it loads except glibc's own
+  b=$(command -v "$n")
+  mkdir -p "$n/bin" "$n/lib"; cp -L "$b" "$n/bin/$n"
+  { ldd "$b" || true; } | awk '$2 == "=>" && $3 ~ /^\// { print $3 }' | while read -r l; do
+    case ${l##*/} in ld-linux*|libc.so.*|libm.so.*|libmvec.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libresolv.so.*|libutil.so.*) ;;
+      *) cp -L "$l" "$n/lib/" ;; esac
+  done
+  if [ "$n" = umr ]; then   # its register database (umr reads UMR_DATABASE_PATH)
+    db=$(find /usr/share/umr -maxdepth 2 -type d -name database 2>/dev/null | head -n1) || db=""
+    if [ -n "$db" ]; then mkdir -p umr/share/umr; cp -r "$db" umr/share/umr/; else echo "warning: no umr database found" >&2; fi
+  fi
+done
+echo "built: native $*"
+SH
+)
+# the verifier's shader and program, cut out of the pinned script exactly as it writes them
+VERIFY_CUT_PY=$(cat <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+for name, tag in (("bc250_compute_verify.comp", "GLSL"), ("bc250_compute_verify.c", "C")):
+    m = re.search(r'^cat >"\$TMPDIR/%s" <<\'%s\'\n(.*?)^%s$' % (re.escape(name), tag, tag), s, re.S | re.M)
+    if not m:
+        sys.exit("ERROR=%s isn't in %s (has the script changed?)" % (name, sys.argv[1]))
+    open(sys.argv[2] + "/" + name, "w").write(m.group(1))
+for k in ("ELEMENTS", "PASSES", "ITERS"):
+    m = re.search(r'^%s=([0-9]+)$' % k, s, re.M)
+    if not m:
+        sys.exit("ERROR=no default %s in %s" % (k, sys.argv[1]))
+    print("def_%s=%s" % (k, m.group(1)))
+PY
+)
+# ctr_build_tools: the verifier always; umr, stress-ng and setpci only where the system lacks them
+ctr_build_tools() {
+  local out="$TOOLS/.build" n defs miss want=()
+  for n in umr stress-ng setpci; do
+    if [[ -x $TOOLS/bin/$n ]] || ! have "$n"; then want+=("$n"); fi   # refresh our copy, or fill a gap
+  done
+  if (( DRY )); then printf '  %s[dry-run]%s would build into %s: the compute verifier%s\n' "$Y" "$N" "$TOOLS" "${want[*]:+, ${want[*]}}"; return 0; fi
+  _bail() { rm -rf "$out"; fail "$1"; return 1; }   # nothing half-built is left behind
+  rm -rf "$out"; mkdir -p "$out/src"
+  defs=$(python3 -c "$VERIFY_CUT_PY" "$VERIFY_SRC" "$out/src" 2>&1) || { _bail "${defs#ERROR=}"; return 1; }
+  if ! ctr_run -i -v "$out:/out" "$CTR_TAG" bash -s -- "${want[@]}" <<<"$CTR_SCRIPT" >>"$LOG" 2>&1; then
+    tail -n 8 "$LOG" | sed 's/^/       /'; _bail "building the tools in the container failed (log: $LOG)"; return 1
+  fi
+  # the verifier: the same options and exit codes as bc250-compute-verify.sh, minus the compile step
+  { echo '#!/usr/bin/env bash'
+    echo "# duggasco's bc250-compute-verify.sh (commit ${DG_COMMIT:0:7}) with its shader and program built"
+    echo "# ahead of time by 'bc250-fixer cu setup' (--deps local), so no compiler is needed on this system."
+    echo 'd=$(dirname "$(readlink -f "$0")")'
+    echo "$defs"
+    cat <<'SH'
+E=$def_ELEMENTS P=$def_PASSES I=$def_ITERS
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --elements) E="${2:?missing value for --elements}"; shift 2 ;;
+    --passes) P="${2:?missing value for --passes}"; shift 2 ;;
+    --iters) I="${2:?missing value for --iters}"; shift 2 ;;
+    --keep-tmp) shift ;;
+    -h|--help) echo "usage: $0 [--elements N] [--passes N] [--iters N]   (ELEMENTS a multiple of 256)"; exit 0 ;;
+    *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[[ $E =~ ^[0-9]+$ && $P =~ ^[0-9]+$ && $I =~ ^[0-9]+$ ]] && (( E > 0 && P > 0 && I > 0 && E % 256 == 0 )) ||
+  { echo "ERROR: --elements, --passes and --iters must be positive integers, --elements a multiple of 256" >&2; exit 2; }
+echo "Running BC-250 compute verifier (prebuilt)..."
+exec "$d/bc250_compute_verify" "$d/bc250_compute_verify.spv" "$E" "$P" "$I"
+SH
+  } >"$out/native/bc250-verify"
+  chmod 0755 "$out/native/bc250-verify"
+  for n in "${want[@]}"; do
+    cat >"$out/$n/$n" <<SH
+#!/bin/sh
+# $n from a Fedora container, with the libraries it needs (bc250-fixer cu setup, --deps local)
+d=\$(dirname "\$(readlink -f "\$0")")
+export LD_LIBRARY_PATH="\$d/lib"
+[ -d "\$d/share/umr/database" ] && export UMR_DATABASE_PATH="\$d/share/umr/database"
+exec "\$d/bin/$n" "\$@"
+SH
+    chmod 0755 "$out/$n/$n"
+  done
+  # everything has to load on this system before it replaces the old copies
+  miss=$(LD_LIBRARY_PATH="" ldd "$out/native/bc250_compute_verify" 2>&1 | grep 'not found')
+  [[ -z $miss ]] || { _bail "the verifier won't load on this system: $miss"; return 1; }
+  for n in "${want[@]}"; do
+    miss=$(LD_LIBRARY_PATH="$out/$n/lib" ldd "$out/$n/bin/$n" 2>&1 | grep 'not found')
+    [[ -z $miss ]] || { _bail "$n won't load on this system: $miss"; return 1; }
+  done
+  mkdir -p "$TOOLS/bin"
+  for n in native "${want[@]}"; do
+    rm -rf "${TOOLS:?}/$n"; mv "$out/$n" "$TOOLS/$n"
+    [[ $n == native ]] || ln -sfn "../$n/$n" "$TOOLS/bin/$n"
+  done
+  printf 'image=%s\nbuilt=%s\ntools=native %s\n' "$CTR_TAG" "$(date -Iseconds)" "${want[*]}" >"$TOOLS/native/BUILT"
+  rm -rf "$out"
+  have restorecon && restorecon -RF "$TOOLS" 2>/dev/null
+  case ":$PATH:" in *":$TOOLS/bin:"*) ;; *) PATH="$PATH:$TOOLS/bin" ;; esac
+  ok "compute verifier built$( (( ${#want[@]} )) && echo "; bundled ${want[*]} (linked from $TOOLS/bin)")"
+}
+ctr_cleanup_images() {
+  have "$CTR" || return 0
+  local i; i=$("$CTR" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep '^localhost/bc250-fixer-tools:')
+  # shellcheck disable=SC2086  # one argument per image
+  [[ -n $i ]] && act "$CTR" rmi $i >/dev/null && did "removed the tools image: $(echo $i)"
+  [[ -n ${SUDO_USER:-} ]] && info "if you ran 'llama build' without sudo, its image is in your own podman storage: podman rmi localhost/bc250-fixer-tools:..."
+  return 0
+}
+
+# tools bundled by --deps local are found after the system's own
+[[ -d $TOOLS/bin ]] && PATH="$PATH:$TOOLS/bin"
+UMR="${UMR:-}"
+resolve_umr() {   # the live manager only looks in fixed places, so it's told which umr to use
+  [[ -n $UMR && -x $UMR ]] && return 0
+  UMR=$(command -v umr 2>/dev/null) || UMR=""
+  [[ -z $UMR && -x /usr/local/bin/umr ]] && UMR=/usr/local/bin/umr
+  [[ -n $UMR ]] && export UMR
+}
+resolve_umr
+if [[ -z $VERIFY ]]; then
+  # --deps local uses the prebuilt verifier, unless this system can still compile the script itself
+  if deps_local && { [[ -x $TOOLS/native/bc250-verify ]] || ! { have gcc && have glslangValidator; }; }; then VERIFY="$TOOLS/native/bc250-verify"
+  else VERIFY="$VERIFY_SRC"; fi
+fi
+lockdown() {   # prints the lockdown mode when it's on; false when it's off
+  local l; l=$(cat /sys/kernel/security/lockdown 2>/dev/null) || l='[none]'
+  grep -q '\[none\]' <<<"$l" && return 1
+  grep -oE '\[[a-z]+\]' <<<"$l"
 }
 
 # =====================================================================================
@@ -1437,9 +1634,8 @@ cu_preflight() {
   is_bc250 || die "this isn't a BC-250 (no PCI device 1002:13fe). --force overrides, at your own risk."
   [[ -f $LM ]] || die "the compute-unit tools aren't installed; run: sudo bc250-fixer cu setup"
   [[ -f $VERIFY ]] || die "the compute verifier isn't installed; run: sudo bc250-fixer cu setup"
-  have umr || [[ -x /usr/local/bin/umr ]] || die "umr isn't installed; run: sudo bc250-fixer cu setup"
-  local ld; ld="$(cat /sys/kernel/security/lockdown 2>/dev/null || echo '[none]')"
-  grep -q '\[none\]' <<<"$ld" || warn "kernel lockdown is on ($ld); umr may be blocked from the GPU registers. Turning Secure Boot off fixes it."
+  resolve_umr || die "umr isn't installed; run: sudo bc250-fixer cu setup"
+  local ld; ld=$(lockdown) && warn "kernel lockdown is on ($ld), usually because Secure Boot is; it blocks umr's writes to the GPU registers. Turning Secure Boot off fixes it."
   [[ -d /var/log/journal ]] || warn "the journal isn't persistent, so a test that freezes the board leaves no kernel log to read afterwards (sudo bc250-fixer fix journal)"
 }
 
@@ -1507,13 +1703,20 @@ soak_run() {
 cu_setup() {
   need_root "cu setup"
   start_log cu-setup
-  section "Installing packages"
-  case $(pkg_mgr) in
-    dnf|rpm-ostree) pkg_install git gcc glslang vulkan-headers vulkan-loader-devel vulkan-tools stress-ng pciutils python3 curl ;;
-    pacman) pkg_install git gcc glslang vulkan-headers vulkan-icd-loader vulkan-tools stress-ng pciutils python curl ;;
-    apt) pkg_install git gcc glslang-tools libvulkan-dev vulkan-tools stress-ng pciutils python3 curl ;;
-    *) die "no supported package manager; install git, gcc, glslangValidator, Vulkan headers and loader, vulkan-tools, stress-ng, pciutils, python3, curl" ;;
-  esac
+  if deps_local; then
+    section "Tools: built in a container ($(deps_why))"
+    local c; for c in git python3; do have "$c" || die "$c is needed and isn't on this system"; done
+    ctr_check
+    local ld; ld=$(lockdown) && warn "kernel lockdown is on ($ld): the tools will build, but umr can't write the GPU registers until Secure Boot is off"
+  else
+    section "Installing packages"
+    case $(pkg_mgr) in
+      dnf|rpm-ostree) pkg_install git gcc glslang vulkan-headers vulkan-loader-devel vulkan-tools stress-ng pciutils python3 curl ;;
+      pacman) pkg_install git gcc glslang vulkan-headers vulkan-icd-loader vulkan-tools stress-ng pciutils python curl ;;
+      apt) pkg_install git gcc glslang-tools libvulkan-dev vulkan-tools stress-ng pciutils python3 curl ;;
+      *) die "no supported package manager; install git, gcc, glslangValidator, Vulkan headers and loader, vulkan-tools, stress-ng, pciutils, python3, curl" ;;
+    esac
+  fi
   section "Fetching the community tools (pinned commits)"
   _fetch() {   # repo commit dir
     if [[ "$(git -C "$3" rev-parse HEAD 2>/dev/null)" == "$2" ]]; then ok "$(basename "$3") already at ${2:0:7}"; return; fi
@@ -1526,9 +1729,15 @@ cu_setup() {
   act mkdir -p "$TOOLS"
   _fetch "$LM_REPO" "$LM_COMMIT" "$TOOLS/live"
   _fetch "$DG_REPO" "$DG_COMMIT" "$TOOLS/duggasco"
+  if deps_local; then
+    section "Building the test tools (Fedora $(fedora_rel) container; nothing is installed on the system)"
+    ctr_image || die "no tools image, so nothing was built"
+    ctr_build_tools || die "the tools weren't built; the old ones (if any) are untouched"
+    VERIFY="$TOOLS/native/bc250-verify"; resolve_umr
+  fi
   (( DRY )) && return 0
   chmod +x "$LM"
-  if ! have umr; then
+  if ! resolve_umr; then
     info "installing umr through the live manager (dnf, rpm-ostree, pacman/paru or apt; apt builds it from source)"
     "$LM" --yes install-umr || die "couldn't install umr"
   fi
@@ -1538,7 +1747,7 @@ cu_setup() {
   ok "routing readable: $(cu_count "${CUR[@]}")/40 CUs routed, factory map $(cu_count "${DRV[@]}") CUs"
   info "extra WGPs available to test: $(candidates | tr '\n' ' ')"
   printf '  running a quick correctness check at the current routing...\n'
-  if bash "$VERIFY" --elements 262144 --passes 1 >>"$LOG" 2>&1; then ok "compute verifier builds and passes"
+  if bash "$VERIFY" --elements 262144 --passes 1 >>"$LOG" 2>&1; then ok "compute verifier runs and passes"
   else die "the compute verifier failed at the current routing (log: $LOG)"; fi
   printf '\n  Next: sudo bc250-fixer cu test   (about 25-35 min)\n'
 }
@@ -1861,7 +2070,7 @@ cmd_cpu() {
     test)
       no_dry "cpu test"
       need_root "cpu test"
-      have stress-ng || die "stress-ng isn't installed (sudo bc250-fixer cu setup installs it)"
+      local stress; stress=$(command -v stress-ng) || die "stress-ng isn't installed (sudo bc250-fixer cu setup installs it)"
       start_log cpu-test
       local secs="${1:-20}" n cpu fails=() t0 ct hw="" maxc=0 k sp
       [[ $secs =~ ^[0-9]+$ ]] || die "seconds must be a number"
@@ -1872,11 +2081,11 @@ cmd_cpu() {
       for (( cpu = 0; cpu < n; cpu++ )); do
         printf '  cpu%-3s ... ' "$cpu"
         if [[ "$(cat /sys/devices/system/cpu/cpu$cpu/online 2>/dev/null || echo 1)" != 1 ]]; then printf 'offline\n'; fails+=("cpu$cpu(offline)"); continue; fi
-        if taskset -c "$cpu" stress-ng --cpu 1 --cpu-method all --verify --timeout "${secs}s" >>"$LOG" 2>&1; then printf '%sPASS%s\n' "$G" "$N"
+        if taskset -c "$cpu" "$stress" --cpu 1 --cpu-method all --verify --timeout "${secs}s" >>"$LOG" 2>&1; then printf '%sPASS%s\n' "$G" "$N"
         else printf '%sFAIL%s\n' "$R" "$N"; fails+=("cpu$cpu"); fi
       done
       printf '  all threads, 60s ... '
-      stress-ng --cpu 0 --cpu-method all --verify --timeout 60s >>"$LOG" 2>&1 & sp=$!
+      "$stress" --cpu 0 --cpu-method all --verify --timeout 60s >>"$LOG" 2>&1 & sp=$!
       while kill -0 "$sp" 2>/dev/null; do
         [[ -n $hw ]] && { ct=$(( $(cat "$hw") / 1000 )); (( ct > maxc )) && maxc=$ct; }
         sleep 1
@@ -1908,8 +2117,13 @@ GOV_CFG="${GOV_CFG:-/etc/cyan-skillfish-governor-smu/config.toml}"
 GOV_STATE="$STATE/gov"
 GOV_BUS_NAME="com.cyanskillfish.Governor"
 GOV_BUS_PATH="/com/cyanskillfish/Governor"
-GOV_TAG="${GOV_TAG:-v0.4.9}"   # pinned release (only for distros without a COPR/AUR package)
-GOV_API="https://api.github.com/repos/filippor/cyan-skillfish-governor/releases/tags/$GOV_TAG"
+# Pinned release, used where there's no COPR/AUR package (and by --deps local). It has to be
+# v0.4.10 or later: before that the D-Bus name was com.cyan.SkillFishGovernor, with no TestMode.
+GOV_TAG="${GOV_TAG:-v0.4.15}"
+GOV_REPO="filippor/cyan-skillfish-governor"
+GOV_API="https://api.github.com/repos/$GOV_REPO/releases/tags/$GOV_TAG"
+GOV_ROOT="${GOV_ROOT:-}"   # prefix for the local install's paths (tests)
+GOV_MANIFEST="$GOV_STATE/local-install.files"
 GOV_COPR="filippor/bazzite"
 SAFE_MHZ=1500          # the community's stable baseline (1500 MHz @ 900 mV)
 MAX_TUNE_MV=1050       # the tuner never asks for more without --force
@@ -2069,7 +2283,7 @@ gov_cap() {   # effective highest clock: the config's max, bounded by the top of
   else echo "${top:-0}"; fi
 }
 gov_interp() { python3 -c "$GOVCFG_PY" interp "$GOV_CFG" "$1" 2>/dev/null; }
-gov_installed() { have cyan-skillfish-governor-smu || [[ -x /etc/cyan-skillfish-governor-smu/cyan-skillfish-governor-smu ]] || systemctl cat "$GOV_SVC" >/dev/null 2>&1; }
+gov_installed() { have cyan-skillfish-governor-smu || [[ -x $GOV_ROOT/usr/local/bin/$GOV_SVC ]] || [[ -x /etc/cyan-skillfish-governor-smu/cyan-skillfish-governor-smu ]] || systemctl cat "$GOV_SVC" >/dev/null 2>&1; }
 gov_active() { systemctl is-active -q "$GOV_SVC" 2>/dev/null; }
 gov_on_bus() {
   busctl --system call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus NameHasOwner s "$GOV_BUS_NAME" 2>/dev/null | grep -q true
@@ -2126,21 +2340,82 @@ gov_status() {
   fi
 }
 
+# gov_install_local: the release tarball (sha256 checked) into /usr/local/bin, plus the files
+# the tarball leaves out, from the same tag: the D-Bus policy (without it the tuner can't
+# reach the governor), the performance-mode script and the systemd unit. No package manager,
+# so it works on rpm-ostree without layering. The tarball's own install.sh isn't used: it
+# stops at the first missing file, after putting the binary in /etc. Files are listed in
+# $GOV_MANIFEST for 'gov uninstall'.
+gov_install_local() {
+  [[ $(uname -m) == x86_64 ]] || { fail "the release build is x86_64 only"; return 1; }
+  local name="cyan-skillfish-governor-smu-$GOV_TAG-x86_64-linux" raw="https://raw.githubusercontent.com/$GOV_REPO/$GOV_TAG"
+  local url="https://github.com/$GOV_REPO/releases/download/$GOV_TAG/$name.tar.gz" tmp d f sum miss
+  local bin="$GOV_ROOT/usr/local/bin/$GOV_SVC" perf="$GOV_ROOT/usr/local/bin/cyan-skillfish-performance-mode"
+  local pol="$GOV_ROOT/etc/dbus-1/system.d/$GOV_BUS_NAME.conf" rule="$GOV_ROOT/etc/udev/rules.d/70-cyan-skillfish-governor.rules"
+  local unit="$SYSTEMD_DIR/$GOV_SVC.service"
+  info "release $GOV_TAG from github.com/$GOV_REPO, checksum-checked, into /usr/local/bin and /etc"
+  if (( DRY )); then
+    for f in "$bin" "$perf" "$pol" "$rule" "$unit"; do printf '  %s[dry-run]%s would install %s\n' "$Y" "$N" "$f"; done
+    [[ -e $GOV_CFG ]] || printf '  %s[dry-run]%s would install the default config at %s\n' "$Y" "$N" "$GOV_CFG"
+    return 0
+  fi
+  tmp=$(mktemp -d)
+  curl -fsSL --retry 3 -o "$tmp/gov.tar.gz" "$url" && curl -fsSL --retry 3 -o "$tmp/gov.sha256" "$url.sha256" &&
+    curl -fsSL --retry 3 -o "$tmp/policy.conf" "$raw/$GOV_BUS_NAME.conf" &&
+    curl -fsSL --retry 3 -o "$tmp/perf" "$raw/scripts/cyan-skillfish-performance-mode" &&
+    curl -fsSL --retry 3 -o "$tmp/unit" "$raw/$GOV_SVC.service" || { rm -rf "$tmp"; fail "download failed ($url)"; return 1; }
+  sum=$(awk '{print $1}' "$tmp/gov.sha256")
+  [[ -n $sum && "$(sha256sum "$tmp/gov.tar.gz" | awk '{print $1}')" == "$sum" ]] || { rm -rf "$tmp"; fail "checksum mismatch on the governor download"; return 1; }
+  tar xzf "$tmp/gov.tar.gz" -C "$tmp" && d="$tmp/$name" && [[ -x $d/$GOV_SVC && -s $d/config.toml && -s $d/70-cyan-skillfish-governor.rules ]] ||
+    { rm -rf "$tmp"; fail "the tarball isn't laid out as expected"; return 1; }
+  # the files fetched beside it must be what they claim, and the binary must load here
+  grep -q "$GOV_BUS_NAME" "$tmp/policy.conf" && grep -q '^ExecStart=/usr/bin/cyan-skillfish-governor-smu ' "$tmp/unit" &&
+    [[ "$(head -c 2 "$tmp/perf")" == '#!' ]] || { rm -rf "$tmp"; fail "the files fetched from tag $GOV_TAG don't look right"; return 1; }
+  miss=$(ldd "$d/$GOV_SVC" 2>&1 | grep -E 'not found|version .GLIBC')
+  [[ -z $miss ]] || { rm -rf "$tmp"; fail "the release build won't run on this system: $miss"; return 1; }
+  install -D -m 0755 "$d/$GOV_SVC" "$bin" && install -D -m 0755 "$tmp/perf" "$perf" &&
+    install -D -m 0644 "$tmp/policy.conf" "$pol" && install -D -m 0644 "$d/70-cyan-skillfish-governor.rules" "$rule" || { rm -rf "$tmp"; fail "couldn't install the files"; return 1; }
+  sed "s#^ExecStart=/usr/bin/#ExecStart=/usr/local/bin/#" "$tmp/unit" | install -D -m 0644 /dev/stdin "$unit" || { rm -rf "$tmp"; fail "couldn't write $unit"; return 1; }
+  local -a files=("$bin" "$perf" "$pol" "$rule" "$unit")
+  [[ -e $GOV_CFG ]] || install -D -m 0644 "$d/config.toml" "$GOV_CFG"   # an existing config is kept
+  rm -rf "$tmp"
+  mkdir -p "$GOV_STATE"; printf '%s\n' "${files[@]}" >"$GOV_MANIFEST"
+  have restorecon && restorecon -q "${files[@]}" "$GOV_CFG" 2>/dev/null
+  busctl --system call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig >/dev/null 2>&1 || true
+  udevadm control --reload-rules 2>/dev/null; udevadm trigger --action=change --subsystem-match=drm 2>/dev/null; udevadm settle --timeout=30 2>/dev/null
+  systemctl daemon-reload
+  ok "installed $GOV_TAG: $bin, its unit, D-Bus policy and udev rule"
+}
+gov_uninstall() {
+  need_root "gov uninstall"
+  [[ -s $GOV_MANIFEST ]] || die "this tool didn't install the governor here (no $GOV_MANIFEST). A package install is removed with your package manager, e.g. sudo dnf remove $GOV_SVC"
+  info "will remove: $(tr '\n' ' ' <"$GOV_MANIFEST")"
+  info "kept: $GOV_CFG (your clock limits and curve)"
+  ask "Stop the governor and remove it?" || { info "cancelled"; return 0; }
+  act systemctl disable -q --now "$GOV_SVC" 2>/dev/null
+  local f; while IFS= read -r f; do [[ -n $f ]] && act rm -f "$f"; done <"$GOV_MANIFEST"
+  act rm -f "$GOV_MANIFEST"
+  act systemctl daemon-reload; act udevadm control --reload-rules 2>/dev/null
+  did "removed; without a governor the GPU runs at the firmware's and driver's default clocks"
+}
 gov_install() {
   need_root "gov install"
   section "Installing $GOV_SVC"
   if gov_installed; then ok "already installed"
   else
-    case $(pkg_mgr) in
+    local ld; ld=$(lockdown) && warn "kernel lockdown is on ($ld), usually because Secure Boot is. The governor sets clocks through PCI config writes to the SMU, which lockdown blocks, so it may run without changing anything. Turning Secure Boot off fixes it."
+    if deps_local; then
+      info "installing the release build into /usr/local and /etc, with no package manager ($(deps_why))"
+      gov_install_local || die "the governor wasn't installed"
+    else case $(pkg_mgr) in
       dnf)
         act dnf -y copr enable "$GOV_COPR" || { pkg_install dnf-plugins-core; act dnf -y copr enable "$GOV_COPR"; } || die "couldn't enable the COPR repo $GOV_COPR"
         act dnf install -y "$GOV_SVC" || die "dnf couldn't install $GOV_SVC" ;;
-      rpm-ostree)
-        local rel repo url
+      rpm-ostree)   # --deps packages: layer the COPR package
+        local rel repo url have_repo=0 rf
         rel=$(rpm -E %fedora 2>/dev/null); [[ $rel =~ ^[0-9]+$ ]] || die "couldn't tell the Fedora release"
         repo="/etc/yum.repos.d/_copr:copr.fedorainfracloud.org:filippor:bazzite.repo"
         url="https://copr.fedorainfracloud.org/coprs/$GOV_COPR/repo/fedora-$rel/filippor-bazzite-fedora-$rel.repo"
-        local have_repo=0 rf
         for rf in /etc/yum.repos.d/*.repo; do   # an existing repo file counts only if it's enabled
           grep -qs 'filippor.bazzite' "$rf" && grep -qsE '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*1' "$rf" && have_repo=1
         done
@@ -2152,31 +2427,19 @@ gov_install() {
         local helper=""; have paru && helper=paru; [[ -z $helper ]] && have yay && helper=yay
         [[ -n $helper && -n ${SUDO_USER:-} ]] || die "it's in the AUR (cyan-skillfish-governor-smu). Install it with an AUR helper as your user, e.g.: paru -S cyan-skillfish-governor-smu"
         act runuser -u "$SUDO_USER" -- "$helper" -S --needed "$GOV_SVC" || die "$helper couldn't install $GOV_SVC" ;;
-      *)
-        # Debian/Ubuntu: the release .deb; anything else: the release tarball (sha256 checked)
-        local json tmp asset sum
+      apt)   # the release .deb
+        local json tmp asset
         json=$(curl -fsSL "$GOV_API") || die "couldn't fetch release $GOV_TAG from GitHub"
+        asset=$(python3 -c 'import json,sys; a=[x["browser_download_url"] for x in json.load(sys.stdin)["assets"] if x["name"].endswith("_amd64.deb")]; print(a[0] if a else "")' <<<"$json")
+        [[ -n $asset ]] || die "release $GOV_TAG has no amd64 .deb"
+        warn "the .deb comes from the governor author's $GOV_TAG release; GitHub publishes no checksum for it"
+        info "downloading $(basename "$asset")"
         tmp=$(mktemp -d)
-        if [[ $(pkg_mgr) == apt ]]; then
-          asset=$(python3 -c 'import json,sys; a=[x["browser_download_url"] for x in json.load(sys.stdin)["assets"] if x["name"].endswith("_amd64.deb")]; print(a[0] if a else "")' <<<"$json")
-          [[ -n $asset ]] || die "release $GOV_TAG has no amd64 .deb"
-          warn "the .deb comes from the governor author's $GOV_TAG release; GitHub publishes no checksum for it"
-          info "downloading $(basename "$asset")"
-          act curl -fsSL -o "$tmp/gov.deb" "$asset" || die "download failed"
-          act apt-get install -y "$tmp/gov.deb" || die "apt couldn't install the .deb"
-        else
-          asset=$(python3 -c 'import json,sys; a=[x["browser_download_url"] for x in json.load(sys.stdin)["assets"] if x["name"].endswith("x86_64-linux.tar.gz")]; print(a[0] if a else "")' <<<"$json")
-          [[ -n $asset ]] || die "release $GOV_TAG has no x86_64 tarball"
-          act curl -fsSL -o "$tmp/gov.tar.gz" "$asset" && act curl -fsSL -o "$tmp/gov.tar.gz.sha256" "$asset.sha256" || die "download failed"
-          if (( ! DRY )); then
-            sum=$(awk '{print $1}' "$tmp/gov.tar.gz.sha256")
-            [[ "$(sha256sum "$tmp/gov.tar.gz" | awk '{print $1}')" == "$sum" ]] || die "checksum mismatch on the governor download"
-            tar xzf "$tmp/gov.tar.gz" -C "$tmp" || die "couldn't unpack it"
-            ( cd "$tmp"/cyan-skillfish-governor-smu-*/ && ./install.sh ) || die "the governor's install.sh failed"
-          fi
-        fi
+        act curl -fsSL -o "$tmp/gov.deb" "$asset" || { rm -rf "$tmp"; die "download failed"; }
+        act apt-get install -y "$tmp/gov.deb" || { rm -rf "$tmp"; die "apt couldn't install the .deb"; }
         rm -rf "$tmp" ;;
-    esac
+      *) gov_install_local || die "the governor wasn't installed" ;;
+    esac; fi
     (( DRY )) || gov_installed || die "the install finished but $GOV_SVC still isn't there"
     did "installed"
   fi
@@ -2416,7 +2679,8 @@ cmd_gov() {
     tune) gov_tune ;;
     undervolt) gov_undervolt "$@" ;;
     restore) gov_restore ;;
-    *) die "usage: bc250-fixer gov status|install|safe|limit MHZ|tune|undervolt [MHZ]|restore" ;;
+    uninstall) gov_uninstall ;;
+    *) die "usage: bc250-fixer gov status|install|safe|limit MHZ|tune|undervolt [MHZ]|restore|uninstall" ;;
   esac
 }
 
@@ -2485,7 +2749,12 @@ cmd_llama() {
   local dir; dir=$(llama_dir)
   case $sub in
     build)
-      if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+      if deps_local; then
+        section "Build tools: a Fedora container ($(deps_why))"
+        ctr_check
+        [[ ${EUID:-$(id -u)} -eq 0 && -z ${SUDO_USER:-} ]] && warn "building as root; run it with sudo from your normal user to keep $dir owned by you"
+        ctr_image || die "no tools image to build in"
+      elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
         section "Build dependencies"
         case $(pkg_mgr) in
           dnf|rpm-ostree) pkg_install git cmake gcc-c++ make vulkan-headers vulkan-loader-devel glslc spirv-headers-devel ;;
@@ -2506,8 +2775,23 @@ cmd_llama() {
       local jobs avail
       jobs=$(nproc); avail=$(awk '/^MemAvailable:/{print $2*1024}' /proc/meminfo)
       (( avail < 4*GiB )) && { jobs=2; warn "only $(gib "$avail") GiB free (a model loaded?): building with 2 jobs to avoid running out of memory"; }
-      act as_user cmake -S "$dir" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF || die "cmake configure failed"
-      act as_user cmake --build "$dir/build" --config Release -j "$jobs" --target llama-server llama-bench llama-cli || die "build failed"
+      if deps_local; then
+        # Built in the container, run on the host. Static ggml and no OpenMP leave only
+        # libvulkan, libstdc++ and glibc to find here, and the system has all three.
+        local -a u=()
+        if [[ ${EUID:-$(id -u)} -eq 0 && -n ${SUDO_USER:-} ]]; then u=(--user "$(id -u "$SUDO_USER"):$(id -g "$SUDO_USER")")
+        elif [[ ${EUID:-$(id -u)} -ne 0 ]]; then u=(--userns=keep-id); fi
+        act ctr_run "${u[@]}" -e HOME=/tmp -v "$dir:$dir" -w "$dir" "$CTR_TAG" sh -c \
+          "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF && cmake --build build --config Release -j $jobs --target llama-server llama-bench llama-cli" ||
+          die "the build in the container failed"
+        if (( ! DRY )); then
+          local miss; miss=$(ldd "$dir/build/bin/llama-server" 2>&1 | grep 'not found')
+          [[ -z $miss ]] || die "llama-server was built but won't load on this system: $miss"
+        fi
+      else
+        act as_user cmake -S "$dir" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF || die "cmake configure failed"
+        act as_user cmake --build "$dir/build" --config Release -j "$jobs" --target llama-server llama-bench llama-cli || die "build failed"
+      fi
       (( DRY )) && return 0
       local v
       v=$("$dir/build/bin/llama-server" --version 2>&1 | grep -oE 'version: [0-9]+' | grep -oE '[0-9]+' | head -n1)
@@ -2553,6 +2837,7 @@ cmd_report() {
   {
     echo "== bc250-fixer $VERSION, $(date)"; echo "== uname"; uname -a
     echo "== os-release"; cat /etc/os-release 2>/dev/null
+    echo "== tools: --deps $DEPS ($(deps_local && echo local || echo packages)), umr ${UMR:-none}, verifier $VERIFY"; cat "$TOOLS/native/BUILT" 2>/dev/null
     echo "== cmdline"; cat /proc/cmdline
     echo "== firmware"; for f in bios_vendor bios_version bios_date board_name product_name; do printf '%s: %s\n' "$f" "$(cat /sys/class/dmi/id/$f 2>/dev/null)"; done
     echo "== lspci (GPU)"; lspci -nnk 2>/dev/null | grep -A3 -iE 'vga|display'
@@ -2607,6 +2892,7 @@ cmd_uninstall() {
   act rm -f "$INSTALL_PATH" && did "removed $INSTALL_PATH"
   if [[ ${1:-} == purge ]]; then
     act rm -rf "$TOOLS" "$STATE" && did "removed $TOOLS and $STATE (test results, logs, CMOS backups)"
+    ctr_cleanup_images
   else
     info "kept $TOOLS (community tools) and $STATE (results, logs, CMOS backups); 'bc250-fixer uninstall purge' removes them"
   fi
